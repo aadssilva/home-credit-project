@@ -1,10 +1,11 @@
 ---
 title: "Home Credit Default Risk — Exploratory Data Analysis"
-author: "Anderson Adriano dos Santos Silva"
+author: "Anderson Silva"
 date: "2026-09-20"
 format:
   html:
     toc: true
+    toc-title: "Contents"
     toc-depth: 3
     code-fold: false
     code-overflow: wrap
@@ -15,15 +16,17 @@ execute:
   message: false
 ---
 
-# Introduction
+# Business Problem
 
-Home Credit needs to distinguish applicants who are more likely to experience payment difficulty from applicants who are likely to repay. Two errors matter to the lender: approving applicants with higher repayment risk and rejecting applicants who could repay. The later project will use supervised classification and approval thresholds. This notebook focuses only on EDA of the current-application tables. `TARGET = 1` is the observed payment-difficulty outcome and `TARGET = 0` means no observed payment difficulty. The goal here is to understand the data, identify data-quality problems, and decide which applicant characteristics should be carried into the modeling phase.
+Home Credit needs to distinguish applicants who are more likely to experience payment difficulty from applicants who are likely to repay. Both decision errors matter: approving higher-risk applicants can increase credit losses, while rejecting applicants who could repay can reduce access to credit and potential business value. `TARGET = 1` is the observed payment-difficulty outcome and `TARGET = 0` means no observed payment difficulty.
 
-Only `application_train.csv` and `application_test.csv` are required for this assignment, so I did not join the supplementary Home Credit tables. As a result, this EDA cannot evaluate full credit-file depth, previous repayment history, or true thin-file status.
+Later stages of the project will use supervised classification and decision thresholds. This notebook focuses on exploratory data analysis (EDA): understanding the application data, identifying data-quality issues, testing which applicant characteristics are associated with payment difficulty, and converting those findings into clear data-preparation decisions.
 
-## Questions for this EDA
+This version focuses on `application_train.csv` and `application_test.csv`. The supplementary Home Credit tables are not joined here, so the analysis does not measure full credit-file depth, previous repayment behavior, or true thin-file status.
 
-I divided the EDA into six data-integrity questions and five business questions. The business questions follow the approved order, with the final question combining the previous results.
+# Questions
+
+The EDA is organized around six data-integrity questions and five business questions. The final business question summarizes the strongest descriptive associations found in the earlier sections.
 
 1. Is the target distribution sufficiently represented for EDA and later modeling?
 2. Is missingness related to the observed payment-difficulty outcome?
@@ -48,17 +51,14 @@ library(ggplot2)
 options(scipen = 999)
 
 # Load only the files required for this EDA.
-train <- read.csv("data/raw/application_train.csv")
-test <- read.csv("data/raw/application_test.csv")
-dictionary <- read.csv(
-  "docs/HomeCredit_columns_description.csv",
-  fileEncoding = "latin1"
-)
+train <- read.csv("../data/raw/application_train.csv")
+test <- read.csv("../data/raw/application_test.csv")
+dictionary <- read.csv("../docs/HomeCredit_columns_description.csv")
 ```
 
-# Description of the data
+# Data Description
 
-Both application tables have the same grain: one row represents one current loan application identified by `SK_ID_CURR`. The training table contains `TARGET`; the test table does not. `SK_ID_CURR` is unique within each table, and the two sets of IDs do not overlap. For that reason, the tables are separate samples and should not be joined to each other.
+Both application tables have the same grain: one row represents one current loan application identified by `SK_ID_CURR`. The training table contains `TARGET`; the test table does not. `SK_ID_CURR` is unique within each table, and the ID sets do not overlap. The two tables are therefore separate samples, not tables that should be joined to each other.
 
 ```{r}
 # Quick structural summary of the two application tables.
@@ -76,7 +76,7 @@ data_structure <- data.frame(
 knitr::kable(data_structure, caption = "Application-table structure")
 ```
 
-To make the dictionary easier to use in the EDA, I grouped the application columns by the type of information they contain.
+For the analysis, I grouped the application columns by the type of information they represent.
 
 | Column group | Examples | Role in this EDA |
 |---|---|---|
@@ -89,13 +89,13 @@ To make the dictionary easier to use in the EDA, I grouped the application colum
 | Contact, region, and documents | `FLAG_*`, `REG_*`, `LIVE_*`, `REGION_RATING_*`, `FLAG_DOCUMENT_*` | Contact, location, and application-document information |
 | Bureau inquiries | `AMT_REQ_CREDIT_BUREAU_*` | Recent credit-seeking activity |
 
-The data map found several discrepancies between the dictionary and the observed data. `DAYS_EMPLOYED = 365243` is not documented, `CODE_GENDER` contains `XNA`, and the test set has one `REGION_RATING_CLIENT_W_CITY = -1`. Four building `*_MODE` columns are described as normalized information even though their observed values are categorical. The dictionary also lists `TARGET` under `application_{train|test}`, although the test table correctly has no target.
+The data map also identified several discrepancies between the dictionary and the observed values. `DAYS_EMPLOYED = 365243` is not documented, `CODE_GENDER` contains `XNA`, and the test set contains one `REGION_RATING_CLIENT_W_CITY = -1`. Four building `*_MODE` fields are described as normalized information even though their observed values are categorical. The dictionary also lists `TARGET` under `application_{train|test}`, although the test table correctly has no target.
 
-# Data integrity
+# Data Integrity
 
-## Target distribution
+## 1. Target Distribution
 
-### Is the target distribution sufficiently represented for EDA and later modeling?
+**Question:** Is the target distribution sufficiently represented for EDA and later modeling?
 
 ```{r}
 # Count the two TARGET outcomes and calculate their percentage.
@@ -120,11 +120,11 @@ ggplot(target_distribution,
   theme_minimal()
 ```
 
-`TARGET = 1` represents about 8% of the training applications, so the outcome is imbalanced. This is enough to continue the EDA, but the later train/test split should preserve this proportion. I also should not evaluate the model by accuracy alone. This is consistent with the BPS choice to use ROC-AUC and threshold analysis for model evaluation.
+`TARGET = 1` represents about 8% of the training applications, so the outcome is materially imbalanced. The sample is still large enough for EDA, but later validation should preserve the class proportion. Model evaluation should not rely on accuracy alone; ROC-AUC and threshold-based tradeoffs are more consistent with the Business Problem Statement (BPS).
 
-## Missingness and `TARGET`
+## 2. Missingness and `TARGET`
 
-### Is missingness related to the observed payment-difficulty outcome?
+**Question:** Is missingness related to the observed payment-difficulty outcome?
 
 ```{r}
 # Missingness across every training column.
@@ -173,11 +173,11 @@ knitr::kable(
 )
 ```
 
-Missingness is related to `TARGET` for some variables. The six bureau-inquiry variables, for example, are missing for the same 13.5% of applications, and those applications have a higher payment-difficulty rate than applications with inquiry information. I will not use complete-case deletion in the modeling phase. When missingness appears informative, I will preserve it with a missing category or an indicator variable.
+Missingness is related to `TARGET` for some variables. The six bureau-inquiry fields, for example, are missing for the same 13.5% of applications, and those applicants have a higher payment-difficulty rate than applicants with inquiry information. Complete-case deletion would therefore remove potentially informative cases. The preparation workflow preserves missingness indicators for the external scores and bureau-inquiry fields, while other missing-data treatment remains a modeling decision.
 
-## Invalid and implausible values
+## 3. Invalid and Implausible Values
 
-### Are there impossible, undocumented, or implausible values that require a data-preparation decision?
+**Question:** Are there impossible, undocumented, or implausible values that require a data-preparation decision?
 
 ```{r}
 # Direct conflicts or undocumented values identified against the dictionary.
@@ -246,11 +246,11 @@ extreme_values <- data.frame(
 knitr::kable(extreme_values, digits = 3, caption = "Values flagged for source verification")
 ```
 
-`DAYS_EMPLOYED = 365243` cannot represent employment tenure literally. I will convert this value to missing before calculating tenure and keep an indicator showing that the original value was the sentinel. I will treat the test-set region rating of `-1` and `CODE_GENDER = XNA` as invalid or unknown codes instead of mapping them to valid categories. The four building `*_MODE` fields will be treated as categorical. Very large income values, burden ratios, inquiry counts, and household counts will be flagged for review, but not removed only because they are extreme.
+`DAYS_EMPLOYED = 365243` cannot represent employment tenure literally, so it should be converted to missing before tenure is calculated. The test-set region rating of `-1` and `CODE_GENDER = XNA` should also be treated as invalid or unknown rather than mapped to valid categories. The four building `*_MODE` fields should remain categorical. Extreme income values, burden ratios, inquiry counts, and household counts are retained unless there is evidence that they are invalid; extremeness alone is not a reason to delete a row.
 
-## Keys, duplicates, and grain
+## 4. Keys, Duplicates, and Grain
 
-### Do the two application tables have the expected grain, keys, and duplicate structure?
+**Question:** Do the two application tables have the expected grain, keys, and duplicate structure?
 
 ```{r}
 # Confirm one row per SK_ID_CURR and check whether the samples overlap.
@@ -269,11 +269,11 @@ knitr::kable(key_check, caption = "Primary-key check")
 cat("Shared SK_ID_CURR values between train and test:", shared_ids)
 ```
 
-Both tables have one row per application, and `SK_ID_CURR` is unique in each table. The ID sets do not overlap, so there is no train-to-test join relationship. I will keep the tables as separate samples and use `application_train` for target-based EDA because it is the only table with `TARGET`.
+Both tables have one row per application, and `SK_ID_CURR` is unique in each table. The ID sets do not overlap, so there is no train-to-test join relationship. The tables remain separate samples, and target-based EDA uses `application_train` because it is the only table with `TARGET`.
 
-## Relative-time direction
+## 5. Relative-Time Direction
 
-### Do relative-time variables follow the direction described in the data dictionary?
+**Question:** Do relative-time variables follow the direction described in the data dictionary?
 
 ```{r}
 # Check every DAYS_* field in the training table.
@@ -289,11 +289,11 @@ time_check <- data.frame(
 knitr::kable(time_check, caption = "Direction check for DAYS_* variables")
 ```
 
-The relative-day fields follow the expected non-positive direction except for `DAYS_EMPLOYED = 365243`. When I need a duration for interpretation, I will convert valid negative day counts to positive years. The sentinel will first be set to missing; it will not be interpreted as about 1,000 years of employment.
+The relative-day fields follow the expected non-positive direction except for `DAYS_EMPLOYED = 365243`. For interpretation and feature engineering, valid negative day counts can be converted to positive years. The employment sentinel must first be set to missing rather than interpreted as roughly 1,000 years of employment.
 
-## Train/test consistency
+## 6. Train/Test Consistency
 
-### Are the train and test application tables structurally and distributionally consistent enough for a common modeling workflow?
+**Question:** Are the train and test application tables structurally and distributionally consistent enough for a common modeling workflow?
 
 ```{r}
 # Compare columns. TARGET is expected to exist only in train.
@@ -355,11 +355,11 @@ knitr::kable(
 )
 ```
 
-The two tables have the same application schema except for the expected train-only `TARGET`. However, a few categorical levels appear only in train, and some variables differ in missingness or central values. The preprocessing workflow therefore needs to handle missing values and categorical levels that may not appear in both samples. Matching column names are not enough to assume that train and test have the same distributions.
+The two tables have the same application schema except for the expected train-only `TARGET`. A few categorical levels appear only in train, and some variables differ in missingness or central values. A common workflow is still appropriate, but model-specific preprocessing must safely handle absent or unseen categorical levels. Matching column names alone does not imply identical distributions.
 
-# Exploratory results
+# Results
 
-For the business questions, I create a small working copy for the derived variables. The original tables remain unchanged.
+The following sections address the five business questions. A small working copy is used for derived variables so the original application tables remain unchanged.
 
 ```{r}
 # Create interpretable age and employment-tenure measures.
@@ -372,9 +372,9 @@ eda <- train |>
   )
 ```
 
-## Proposed loan burden
+## 7. Proposed Loan Burden
 
-### Is payment difficulty associated with application-level proxies for the burden of the proposed loan relative to reported income?
+**Question:** Is payment difficulty associated with application-level proxies for the burden of the proposed loan relative to reported income?
 
 ```{r}
 # Build three simple burden ratios.
@@ -450,11 +450,11 @@ ggplot(burden_summary,
   theme_minimal()
 ```
 
-The three ratios do not have a simple monotonic relationship with payment difficulty. The annuity-to-income rate increases through the fourth quintile, while the highest credit-to-income and goods-price-to-income groups have lower observed rates than the middle groups. This may reflect underwriting or loan-size selection: applicants who receive very large proposed loans relative to income may differ from the rest of the sample in ways these ratios do not capture. I will keep the ratios as candidate features, but I will allow for nonlinear effects and will not use them as a direct affordability rule. They also cannot replace total debt-to-income or residual cash flow because the current tables do not include existing debt payments or household expenses.
+The three ratios do not show a simple monotonic relationship with payment difficulty. The annuity-to-income rate rises through the fourth quintile, while the highest credit-to-income and goods-price-to-income groups have lower observed rates than some middle groups. This may reflect underwriting or loan-size selection rather than a direct affordability effect. The ratios remain useful candidate features, but they should not be treated as approval rules or as substitutes for total debt-to-income or residual cash flow, which cannot be calculated from the current application tables.
 
-## External risk scores
+## 8. External Risk Scores
 
-### How well do the external risk scores distinguish applicants who experience payment difficulty from those who do not?
+**Question:** How well do the external risk scores distinguish applicants who experience payment difficulty from those who do not?
 
 ```{r}
 # Small helper to calculate a rank-based AUC for one score.
@@ -525,11 +525,11 @@ ggplot(ext_deciles,
   theme_minimal()
 ```
 
-All three external scores have an inverse relationship with payment difficulty: lower scores are associated with higher observed rates. In this sample, `EXT_SOURCE_3` has the strongest standalone separation, followed by `EXT_SOURCE_1` and `EXT_SOURCE_2`. These scores may summarize external borrower-risk information, but the dictionary does not explain who provides them or how they are built. I will keep all three as priority candidate predictors, preserve their missingness information, and not interpret them as FICO-equivalent scores.
+All three external scores have an inverse relationship with payment difficulty: lower scores are associated with higher observed rates. In this sample, `EXT_SOURCE_3` shows the strongest standalone separation, followed by `EXT_SOURCE_1` and `EXT_SOURCE_2`. The dictionary does not identify the score providers or construction methods, so the scores should be treated as external risk signals rather than interpreted as FICO-equivalent measures. All three remain priority candidate predictors, with their missingness preserved.
 
-## Recent credit seeking
+## 9. Recent Credit Seeking
 
-### Is greater recent credit-seeking activity associated with higher payment difficulty?
+**Question:** Is greater recent credit-seeking activity associated with higher payment difficulty?
 
 ```{r}
 # Group inquiry counts into simple bands for each lookback window.
@@ -589,11 +589,11 @@ ggplot(
   theme_minimal()
 ```
 
-The annual inquiry window shows the clearest increase in payment difficulty as inquiry counts rise. The monthly and quarterly patterns are less consistent. Repeated credit seeking may indicate higher credit demand or financial stress, but the different windows do not behave the same way. I will keep the inquiry windows separate instead of summing them. I will also preserve the shared missingness indicator because missing inquiry data is itself associated with a higher payment-difficulty rate.
+The annual inquiry window shows the clearest increase in payment difficulty as inquiry counts rise. The monthly and quarterly patterns are less consistent. Repeated credit seeking may indicate higher credit demand or financial stress, but the windows do not behave the same way. The inquiry measures should therefore remain separate rather than be summed, and their shared missingness should be preserved because missing inquiry data is itself associated with a higher payment-difficulty rate.
 
-## Income and employment context
+## 10. Income and Employment Context
 
-### Which available indicators of income level/source and current employment context or tenure are associated with payment difficulty?
+**Question:** Which available indicators of income level/source and current employment context or tenure are associated with payment difficulty?
 
 ```{r}
 # Reported income quintiles.
@@ -722,13 +722,13 @@ ggplot(tenure_summary |> filter(tenure_band != "Sentinel / unknown"),
   theme(axis.text.x = element_text(angle = 25, hjust = 1))
 ```
 
-The highest income quintile has a lower payment-difficulty rate, and longer valid employment tenure shows a clearer decline in the observed rate. Income source, occupation, and organization type also differ across groups. These variables may capture repayment capacity and employment stability, but they are only a snapshot at the time of application. I will keep them for modeling, recode the employment sentinel before using tenure numerically, and group very rare categories so that very small levels do not drive the model. Occupation and related profile variables will also need group-level review later because a descriptive association does not establish a causal relationship with risk.
+The highest income quintile has a lower payment-difficulty rate, and longer valid employment tenure shows a clearer decline in the observed rate. Income source, occupation, and organization type also differ across groups. These variables may capture repayment capacity and employment stability, but they are only a snapshot at the time of application. They remain candidate predictors, with the employment sentinel cleaned before tenure is used numerically. Rare-category grouping and categorical encoding are better handled during model preprocessing, where their effect can be evaluated directly. These descriptive differences should not be interpreted as causal effects.
 
-## Strongest applicant associations
+## 11. Strongest Applicant Associations
 
-### Which applicant characteristics are most strongly associated with payment difficulty?
+**Question:** Which applicant characteristics are most strongly associated with payment difficulty?
 
-This final question combines the previous results. I use a simple descriptive measure: the difference between the highest and lowest payment-difficulty rate across sufficiently sized groups for each characteristic. This is a univariate comparison, not a measure of causal effect or independent feature importance.
+This final question combines the earlier results using a simple descriptive measure: the difference between the highest and lowest payment-difficulty rate across sufficiently sized groups for each characteristic. The comparison is univariate. It is not a causal estimate and should not be interpreted as independent model feature importance.
 
 ```{r}
 # Create a reusable long table with selected applicant characteristics.
@@ -878,23 +878,28 @@ ggplot(head(association_rank, 10),
   theme_minimal()
 ```
 
-The external-source scores have the largest descriptive rate spreads. Applicant-profile and employment variables such as occupation and age also show large differences. This indicates that the application table already contains variables that separate higher- and lower-risk groups before supplementary history is added. A large univariate spread, however, does not show that a variable will remain important after other predictors are included. I will prioritize these variables in the first modeling dataset, allow for nonlinear relationships, and use the fitted model to evaluate their contribution after other predictors are considered.
+The external-source scores have the largest descriptive rate spreads. Applicant-profile and employment variables such as occupation and age also show meaningful differences. This indicates that the application table already contains variables that separate higher- and lower-risk groups before supplementary credit history is added. A large univariate spread does not mean that a variable will remain important after other predictors are included, so the fitted model will be used to evaluate their contribution jointly.
 
-# Results and conclusion
+# Conclusion and Data-Preparation Decisions
 
-The EDA confirmed that the current-application data contain useful risk differentiation. In the descriptive spread comparison, `EXT_SOURCE_3` shows about a 16.8 percentage-point difference between its lowest- and highest-risk deciles. `EXT_SOURCE_2` and `EXT_SOURCE_1` follow at about 15.4 and 15.0 points. Occupation type and age also show large descriptive spreads, at about 12.3 and 8.6 percentage points. At the same time, some relationships were less simple than I expected. The proposed-loan burden ratios are not monotonic, so I should not assume that a larger requested-loan-to-income ratio directly means greater observed risk.
+The EDA shows that the application data contain meaningful risk differentiation. In the descriptive spread comparison, `EXT_SOURCE_3` has about a 16.8 percentage-point difference between its lowest- and highest-risk deciles. `EXT_SOURCE_2` and `EXT_SOURCE_1` follow at about 15.4 and 15.0 points. Occupation type and age also show large descriptive spreads, at about 12.3 and 8.6 percentage points.
 
-The main data problems and the decisions I will carry into data preparation are:
+Not every relationship is simple. In particular, the proposed-loan burden ratios are not monotonic, so a larger requested-loan-to-income ratio should not be interpreted as directly implying greater observed risk.
+
+The main data-quality findings and their preparation decisions are:
 
 | Data issue | Decision for data preparation |
 |---|---|
-| `DAYS_EMPLOYED = 365243` | Recode to missing for numeric tenure calculations and retain a sentinel/unknown indicator |
+| `DAYS_EMPLOYED = 365243` | Recode to missing before calculating `tenure_years` |
 | `REGION_RATING_CLIENT_W_CITY = -1` in test | Treat as invalid/missing rather than as a valid region rating |
-| `CODE_GENDER = XNA` | Treat as undocumented/unknown; do not silently map to a valid category |
-| Building `*_MODE` fields described as normalized but observed as categories | Treat as categorical variables |
-| Missingness associated with `TARGET` for several fields | Avoid complete-case deletion; preserve informative missingness |
-| Extreme but not necessarily impossible values | Flag and review; do not automatically delete solely because they are extreme |
-| Train-only categorical levels | Use preprocessing that safely handles unseen or absent levels in test |
-| Minority `TARGET = 1` outcome | Preserve class proportions in later splitting and avoid accuracy-only evaluation |
+| `CODE_GENDER = XNA` | Treat as invalid/missing rather than mapping it to a valid category |
+| Building `*_MODE` fields described as normalized but observed as categories | Keep them categorical |
+| Missingness associated with `TARGET` in external-score and bureau-inquiry fields | Avoid complete-case deletion and preserve missingness indicators |
+| Extreme but not necessarily impossible values | Retain them unless there is evidence that they are invalid |
+| Train-only categorical levels | Handle unseen or absent levels during model preprocessing |
+| Nonlinear annuity-to-income pattern | Retain the ratio and a consistent five-group representation |
+| Minority `TARGET = 1` outcome | Preserve class proportions during validation and avoid accuracy-only evaluation |
 
-Relative to the BPS, the EDA supports the assumption that the data can be useful for risk differentiation, especially through the external scores and employment/applicant-profile variables. It also changes the planned preprocessing: I need to account for nonlinear relationships, informative missingness, categorical levels, and the employment sentinel. This EDA does not test the BPS business targets, improvement in holdout ROC-AUC, reason codes, approval-threshold scenarios, or model error rates by group. Those questions require a fitted model and later validation. With only the two application tables, I also cannot establish true thin-file status or full affordability because the supplementary credit-history tables and household cash-flow information are not included.
+Relative to the BPS, the EDA supports the assumption that the application data can differentiate repayment risk, especially through the external scores and employment/applicant-profile variables. It also changes the preprocessing plan by making nonlinear relationships, informative missingness, categorical consistency, and the employment sentinel explicit parts of the workflow.
+
+The EDA does not test business targets, holdout ROC-AUC improvement, reason codes, approval-threshold scenarios, or model error rates by group. Those questions require a fitted model and later validation. With only the application tables, the project also cannot establish true thin-file status or full affordability because detailed credit history and household cash-flow information are not included.
