@@ -1,0 +1,24 @@
+# Home Credit raw datasets
+data/raw/*
+!data/raw/.gitkeep
+
+# Generated/processed datasets
+data/processed/*
+!data/processed/.gitkeep
+
+# R session files
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+
+# Quarto generated/cache files
+.quarto/
+_freeze/
+
+# macOS
+.DS_Store
+
+# Environment / credentials
+.env
+.env.*
