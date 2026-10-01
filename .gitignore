@@ -24,7 +24,5 @@ _freeze/
 .env.*
 
 # Quarto rendered outputs
-README.html
-README_files/
-notebooks/01_eda.html
-notebooks/01_eda_files/
+*.html
+*_files/
