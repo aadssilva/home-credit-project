@@ -26,3 +26,12 @@ _freeze/
 # Quarto rendered outputs
 *.html
 *_files/
+
+# Quarto intermediate files
+*.knit.md
+notebooks/02_modeling.rmarkdown
+
+# Kaggle submissions and saved models
+*submission*.csv
+*.rds
+*.rda

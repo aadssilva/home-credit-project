@@ -1,0 +1,1019 @@
+---
+title: "Home Credit Default Risk — Modeling"
+author: "Anderson Silva"
+date: "2026-10-10"
+format:
+  html:
+    toc: true
+    toc-title: "Contents"
+    toc-depth: 3
+    toc-expand: true
+    number-sections: true
+    number-depth: 2
+    code-fold: false
+    code-overflow: wrap
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+Home Credit needs to rank applicants by their likelihood of payment difficulty while balancing portfolio risk with access to credit. This notebook compares candidate classifiers using ROC-AUC, tunes the selected XGBoost model, and generates predicted probabilities for the competition test set.
+
+This notebook begins with the prepared application-level datasets produced by `scripts/01_data_preparation.R`. It uses cross-validation to establish initial performance benchmarks before evaluating additional modeling approaches. The unlabeled application test data remain reserved for final scoring.
+
+```{r}
+#| label: setup
+
+library(dplyr)
+
+source("../scripts/02_modeling.R")
+
+options(scipen = 999)
+```
+
+# Data Preparation and Validation
+
+The prepared files contain the cleaning and engineered features developed from the earlier exploratory analysis. Model-specific preprocessing is fitted within each training fold to prevent information leakage.
+
+```{r}
+#| label: load-data
+
+train <- readr::read_csv("../data/processed/application_train_prepared.csv")
+test <- readr::read_csv("../data/processed/application_test_prepared.csv")
+
+# The first factor level is the payment-difficulty event used by ROC-AUC.
+train$TARGET <- factor(train$TARGET, levels = c(1, 0))
+```
+
+The integrity checks confirm that the outcome and application key have their expected roles and that train and test share the same predictors.
+
+```{r}
+#| label: validate-data
+
+integrity_checks <- tibble::tibble(
+  check = c(
+    "TARGET exists in train only",
+    "TARGET uses 1 as the positive event",
+    "TARGET is complete in train",
+    "SK_ID_CURR exists in train and test",
+    "SK_ID_CURR is complete in train and test",
+    "SK_ID_CURR is unique in train and test",
+    "Train and test predictors match"
+  ),
+  passed = c(
+    "TARGET" %in% names(train) && !"TARGET" %in% names(test),
+    identical(levels(train$TARGET), c("1", "0")),
+    !anyNA(train$TARGET),
+    "SK_ID_CURR" %in% names(train) && "SK_ID_CURR" %in% names(test),
+    !anyNA(train$SK_ID_CURR) && !anyNA(test$SK_ID_CURR),
+    !anyDuplicated(train$SK_ID_CURR) && !anyDuplicated(test$SK_ID_CURR),
+    identical(names(train)[names(train) != "TARGET"], names(test))
+  )
+)
+
+stopifnot(all(integrity_checks$passed))
+
+knitr::kable(
+  integrity_checks,
+  caption = "Modeling-data integrity checks"
+)
+```
+
+`SK_ID_CURR` stays in the datasets so future predictions can be linked back to each application, but it is excluded from the predictor list.
+
+```{r}
+#| label: modeling-roles
+
+predictor_names <- setdiff(
+  names(train),
+  c("TARGET", "SK_ID_CURR")
+)
+
+data_summary <- tibble::tibble(
+  dataset = c("Prepared train", "Prepared test"),
+  rows = c(nrow(train), nrow(test)),
+  columns = c(ncol(train), ncol(test)),
+  model_predictors = length(predictor_names)
+)
+
+knitr::kable(
+  data_summary,
+  caption = "Prepared modeling data"
+)
+```
+
+# Modeling Approach
+
+The training data are split once into an 80% development sample and a 20% holdout, with the target proportion preserved. Three stratified folds are then created from the development sample. The holdout does not enter cross-validation, and the same fold object will be reused across model experiments.
+
+```{r}
+#| label: create-resamples
+
+set.seed(6812)
+data_split <- rsample::initial_split(
+  train,
+  prop = 0.80,
+  strata = TARGET
+)
+
+development <- rsample::training(data_split)
+holdout <- rsample::testing(data_split)
+
+# Create the folds once so every experiment uses the same assessment rows.
+set.seed(6812)
+cv_folds <- rsample::vfold_cv(
+  development,
+  v = 3,
+  strata = TARGET
+)
+```
+
+```{r}
+#| label: summarize-resamples
+
+split_summary <- tibble::tibble(
+  sample = c("Development", "Holdout"),
+  rows = c(nrow(development), nrow(holdout)),
+  target_1 = c(
+    sum(development$TARGET == "1"),
+    sum(holdout$TARGET == "1")
+  ),
+  target_1_percent = c(
+    mean(development$TARGET == "1") * 100,
+    mean(holdout$TARGET == "1") * 100
+  )
+)
+
+fold_summary <- tibble::tibble(
+  fold = cv_folds$id,
+  analysis_rows = vapply(
+    cv_folds$splits,
+    function(split) nrow(rsample::analysis(split)),
+    integer(1)
+  ),
+  assessment_rows = vapply(
+    cv_folds$splits,
+    function(split) nrow(rsample::assessment(split)),
+    integer(1)
+  )
+)
+
+knitr::kable(
+  split_summary,
+  digits = 2,
+  caption = "Development and holdout samples"
+)
+
+knitr::kable(
+  fold_summary,
+  caption = "Cross-validation folds within the development sample"
+)
+```
+
+`TARGET` is ordered with `1` as the first factor level, and the ROC-AUC metric explicitly uses `event_level = "first"`. Accuracy is available for the baseline, but ROC-AUC is the primary comparison metric because the payment-difficulty outcome is imbalanced.
+
+The prepared `annuity_income_quintile` was calculated from thresholds learned on the full training dataset. During cross-validation, this column must either be excluded or recreated from each analysis fold so that assessment rows do not influence its cut points. No change is made at this stage.
+
+# Model Experiments
+
+## Majority-Class Benchmark
+
+The first benchmark predicts the most common outcome in each analysis fold. Its probability estimate is the analysis-fold share of applicants with `TARGET = 1`, so neither the predicted class nor the probability uses information from the assessment fold.
+
+```{r}
+#| label: majority-class-benchmark
+
+majority_start <- Sys.time()
+
+majority_fold_metrics <- bind_rows(lapply(seq_len(nrow(cv_folds)), function(i) {
+  split <- cv_folds$splits[[i]]
+  analysis_data <- rsample::analysis(split)
+  assessment_data <- rsample::assessment(split)
+
+  majority_class <- names(which.max(table(analysis_data$TARGET)))
+  event_probability <- mean(analysis_data$TARGET == "1")
+
+  fold_predictions <- tibble::tibble(
+    TARGET = assessment_data$TARGET,
+    .pred_class = factor(
+      rep(majority_class, nrow(assessment_data)),
+      levels = levels(analysis_data$TARGET)
+    ),
+    .pred_1 = rep(event_probability, nrow(assessment_data))
+  )
+
+  classification_metrics(
+    fold_predictions,
+    truth = TARGET,
+    estimate = .pred_class,
+    .pred_1
+  ) |>
+    mutate(fold = cv_folds$id[[i]], .before = 1)
+}))
+
+majority_runtime_seconds <- as.numeric(
+  difftime(Sys.time(), majority_start, units = "secs")
+)
+
+majority_summary <- majority_fold_metrics |>
+  group_by(.metric) |>
+  summarise(
+    mean_cv = mean(.estimate),
+    sd_cv = sd(.estimate),
+    .groups = "drop"
+  ) |>
+  mutate(
+    metric = recode(
+      .metric,
+      accuracy = "Accuracy",
+      roc_auc = "ROC-AUC"
+    )
+  ) |>
+  select(metric, mean_cv, sd_cv)
+
+knitr::kable(
+  majority_summary,
+  digits = 4,
+  caption = "Majority-class cross-validation results"
+)
+```
+
+The majority classifier has a mean accuracy of `r sprintf("%.3f", majority_summary$mean_cv[majority_summary$metric == "Accuracy"])`, which mostly reflects the roughly 92% of applicants without observed payment difficulty. Its ROC-AUC is `r sprintf("%.3f", majority_summary$mean_cv[majority_summary$metric == "ROC-AUC"])` because every applicant in a fold receives the same probability. The model therefore has no ability to rank applicants by risk.
+
+## Logistic Regression Benchmark
+
+The logistic benchmark uses the original application predictors. It removes `SK_ID_CURR` and the 15 features added by the preparation pipeline. Missing numeric values are replaced with analysis-fold medians, missing and novel categorical levels receive explicit labels, and categorical predictors are dummy encoded. Each recipe is estimated within its analysis fold.
+
+A ridge logistic regression uses all encoded predictors while shrinking correlated coefficients. The fixed penalty of 0.01 is a preliminary setting that provides regularization without adding a tuning exercise at this stage. The recipe produces a sparse matrix to limit memory use.
+
+```{r}
+#| label: logistic-regression-setup
+
+original_predictor_names <- setdiff(
+  predictor_names,
+  engineered_features
+)
+
+logistic_recipe <- recipes::recipe(TARGET ~ ., data = development) |>
+  recipes::step_rm(
+    SK_ID_CURR,
+    dplyr::all_of(engineered_features)
+  ) |>
+  recipes::step_unknown(
+    recipes::all_nominal_predictors(),
+    new_level = "Missing"
+  ) |>
+  recipes::step_novel(
+    recipes::all_nominal_predictors(),
+    new_level = "Novel"
+  ) |>
+  recipes::step_impute_median(recipes::all_numeric_predictors()) |>
+  recipes::step_dummy(
+    recipes::all_nominal_predictors(),
+    sparse = "yes"
+  ) |>
+  recipes::step_zv(recipes::all_predictors())
+
+logistic_spec <- parsnip::logistic_reg(
+  penalty = 0.01,
+  mixture = 0
+) |>
+  parsnip::set_engine("glmnet", standardize = TRUE) |>
+  parsnip::set_mode("classification")
+
+logistic_workflow <- workflows::workflow() |>
+  workflows::add_recipe(
+    logistic_recipe,
+    blueprint = hardhat::default_recipe_blueprint(
+      composition = "dgCMatrix"
+    )
+  ) |>
+  workflows::add_model(logistic_spec)
+```
+
+```{r}
+#| label: logistic-regression-benchmark
+
+set.seed(6812)
+logistic_start <- Sys.time()
+
+logistic_cv <- tune::fit_resamples(
+  logistic_workflow,
+  resamples = cv_folds,
+  metrics = classification_metrics,
+  control = tune::control_resamples(
+    save_pred = FALSE,
+    verbose = FALSE
+  )
+)
+
+logistic_runtime_seconds <- as.numeric(
+  difftime(Sys.time(), logistic_start, units = "secs")
+)
+
+logistic_summary <- tune::collect_metrics(
+  logistic_cv,
+  summarize = FALSE
+) |>
+  group_by(.metric) |>
+  summarise(
+    mean_cv = mean(.estimate),
+    sd_cv = sd(.estimate),
+    .groups = "drop"
+  ) |>
+  mutate(
+    metric = recode(
+      .metric,
+      accuracy = "Accuracy",
+      roc_auc = "ROC-AUC"
+    )
+  ) |>
+  select(metric, mean_cv, sd_cv)
+
+knitr::kable(
+  logistic_summary,
+  digits = 4,
+  caption = "Logistic regression cross-validation results"
+)
+```
+
+The logistic model reaches a mean ROC-AUC of `r sprintf("%.3f", logistic_summary$mean_cv[logistic_summary$metric == "ROC-AUC"])`. Unlike the majority classifier, it assigns different risk probabilities and provides useful ranking information. Its mean accuracy is `r sprintf("%.3f", logistic_summary$mean_cv[logistic_summary$metric == "Accuracy"])`; this remains a supporting measure because a high value can still be driven by the larger `TARGET = 0` class.
+
+## Engineered Feature Comparison
+
+This comparison keeps the ridge specification, preprocessing, and cross-validation folds fixed while changing only the predictor set. Feature set B replaces the two relative-day fields with age and employment tenure in years, then adds three proposed-loan burden ratios. Feature set C also includes the nine missingness indicators created for the external scores and bureau-inquiry fields. The binned `annuity_income_quintile` is excluded from both sets.
+
+The derived features may give a linear model more direct representations of applicant age, employment tenure, payment burden, and informative missingness. The experiment evaluates each feature group as a whole and does not isolate the contribution of any single variable.
+
+```{r}
+#| label: engineered-feature-sets
+
+financial_time_predictors <- c(
+  setdiff(
+    original_predictor_names,
+    c("DAYS_BIRTH", "DAYS_EMPLOYED")
+  ),
+  "age_years",
+  "tenure_years",
+  "annuity_income",
+  "credit_income",
+  "goods_income"
+)
+
+missingness_features <- grep(
+  "_missing$",
+  engineered_features,
+  value = TRUE
+)
+
+financial_time_missing_predictors <- c(
+  financial_time_predictors,
+  missingness_features
+)
+
+stopifnot(
+  length(original_predictor_names) == 120,
+  length(financial_time_predictors) == 123,
+  length(missingness_features) == 9,
+  length(financial_time_missing_predictors) == 132,
+  !"annuity_income_quintile" %in% financial_time_missing_predictors
+)
+
+engineered_feature_sets <- list(
+  "B — Financial and time features" = financial_time_predictors,
+  "C — Financial, time, and missingness features" =
+    financial_time_missing_predictors
+)
+```
+
+```{r}
+#| label: engineered-feature-models
+
+engineered_results <- bind_rows(lapply(
+  names(engineered_feature_sets),
+  function(feature_set) {
+    feature_names <- engineered_feature_sets[[feature_set]]
+    feature_workflow <- build_model_workflow(
+      development,
+      feature_names,
+      logistic_spec
+    )
+
+    set.seed(6812)
+    model_start <- Sys.time()
+
+    feature_resamples <- tune::fit_resamples(
+      feature_workflow,
+      resamples = cv_folds,
+      metrics = classification_metrics,
+      control = tune::control_resamples(
+        save_pred = FALSE,
+        verbose = FALSE
+      )
+    )
+
+    runtime_seconds <- as.numeric(
+      difftime(Sys.time(), model_start, units = "secs")
+    )
+    fold_metrics <- tune::collect_metrics(
+      feature_resamples,
+      summarize = FALSE
+    )
+
+    tibble::tibble(
+      feature_set = feature_set,
+      predictor_count = length(feature_names),
+      mean_cv_roc_auc = mean(
+        fold_metrics$.estimate[fold_metrics$.metric == "roc_auc"]
+      ),
+      roc_auc_sd = sd(
+        fold_metrics$.estimate[fold_metrics$.metric == "roc_auc"]
+      ),
+      mean_cv_accuracy = mean(
+        fold_metrics$.estimate[fold_metrics$.metric == "accuracy"]
+      ),
+      runtime_seconds = runtime_seconds
+    )
+  }
+))
+
+engineered_comparison <- bind_rows(
+  tibble::tibble(
+    feature_set = "A — Original predictors",
+    predictor_count = length(original_predictor_names),
+    mean_cv_roc_auc = logistic_summary$mean_cv[
+      logistic_summary$metric == "ROC-AUC"
+    ],
+    roc_auc_sd = logistic_summary$sd_cv[
+      logistic_summary$metric == "ROC-AUC"
+    ],
+    mean_cv_accuracy = logistic_summary$mean_cv[
+      logistic_summary$metric == "Accuracy"
+    ],
+    runtime_seconds = logistic_runtime_seconds
+  ),
+  engineered_results
+) |>
+  mutate(
+    roc_auc_difference = mean_cv_roc_auc - first(mean_cv_roc_auc),
+    runtime = sprintf("%.2f seconds", runtime_seconds),
+    .after = mean_cv_roc_auc
+  ) |>
+  select(-runtime_seconds)
+
+knitr::kable(
+  engineered_comparison,
+  digits = 4,
+  caption = "Ridge logistic regression feature-set comparison"
+)
+```
+
+Feature set B changes mean ROC-AUC by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[2])` relative to the original predictors. Feature set C improves on B by `r sprintf("%+.4f", engineered_comparison$mean_cv_roc_auc[3] - engineered_comparison$mean_cv_roc_auc[2])` and on A by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[3])`. These are small descriptive gains. The fold standard deviations describe variation in each model's scores, not uncertainty in the paired differences, so they do not establish statistical significance or the contribution of any single engineered variable.
+
+## XGBoost Comparison
+
+XGBoost can capture nonlinear effects and interactions that ridge logistic regression cannot represent directly. This experiment changes the algorithm while keeping Feature Set C, preprocessing, and cross-validation folds fixed. The initial configuration uses 200 trees, a maximum depth of 4, a learning rate of 0.05, and a minimum node size of 10. These settings are preliminary and are not tuned.
+
+```{r}
+#| label: xgboost-model
+
+xgboost_spec <- parsnip::boost_tree(
+  trees = 200,
+  tree_depth = 4,
+  learn_rate = 0.05,
+  min_n = 10
+) |>
+  parsnip::set_engine("xgboost") |>
+  parsnip::set_mode("classification")
+
+xgboost_workflow <- build_model_workflow(
+  development,
+  financial_time_missing_predictors,
+  xgboost_spec
+)
+
+set.seed(6812)
+xgboost_start <- Sys.time()
+
+xgboost_cv <- tune::fit_resamples(
+  xgboost_workflow,
+  resamples = cv_folds,
+  metrics = classification_metrics,
+  control = tune::control_resamples(
+    save_pred = FALSE,
+    verbose = FALSE
+  )
+)
+
+xgboost_runtime_seconds <- as.numeric(
+  difftime(Sys.time(), xgboost_start, units = "secs")
+)
+
+xgboost_fold_metrics <- tune::collect_metrics(
+  xgboost_cv,
+  summarize = FALSE
+)
+
+xgboost_results <- tibble::tibble(
+  predictor_count = length(financial_time_missing_predictors),
+  mean_cv_roc_auc = mean(
+    xgboost_fold_metrics$.estimate[
+      xgboost_fold_metrics$.metric == "roc_auc"
+    ]
+  ),
+  roc_auc_sd = sd(
+    xgboost_fold_metrics$.estimate[
+      xgboost_fold_metrics$.metric == "roc_auc"
+    ]
+  ),
+  mean_cv_accuracy = mean(
+    xgboost_fold_metrics$.estimate[
+      xgboost_fold_metrics$.metric == "accuracy"
+    ]
+  ),
+  runtime_seconds = xgboost_runtime_seconds
+)
+
+ridge_c_results <- engineered_results |>
+  filter(
+    feature_set == "C — Financial, time, and missingness features"
+  )
+
+xgboost_roc_auc_difference <-
+  xgboost_results$mean_cv_roc_auc - ridge_c_results$mean_cv_roc_auc
+
+knitr::kable(
+  xgboost_results |>
+    mutate(runtime = sprintf("%.2f seconds", runtime_seconds)) |>
+    select(-runtime_seconds),
+  digits = 4,
+  caption = "XGBoost Feature Set C cross-validation results"
+)
+```
+
+XGBoost reaches a mean ROC-AUC of `r sprintf("%.4f", xgboost_results$mean_cv_roc_auc)` and mean accuracy of `r sprintf("%.4f", xgboost_results$mean_cv_accuracy)`. Its ROC-AUC is `r sprintf("%+.4f", xgboost_roc_auc_difference)` relative to ridge logistic regression on the same predictors. This comparison isolates the algorithm change within the current design. With three folds and one fixed XGBoost configuration, the result is descriptive rather than evidence of a statistically significant difference.
+
+## Class Imbalance Comparison
+
+Applicants with `TARGET = 1` make up `r sprintf("%.1f%%", mean(development$TARGET == "1") * 100)` of the development sample. This imbalance makes it worth checking whether a balanced training sample helps XGBoost rank applicants by risk. The comparison keeps Feature Set C, the fixed XGBoost specification, and the existing folds unchanged.
+
+The downsampling step retains all event observations and randomly reduces `TARGET = 0` to the same count within each analysis fold. It is skipped when the recipe processes assessment data, so fold metrics are calculated on the original class distribution.
+
+```{r}
+#| label: xgboost-downsampled
+
+downsampled_xgboost_workflow <- build_model_workflow(
+  development,
+  financial_time_missing_predictors,
+  xgboost_spec,
+  downsample = TRUE
+)
+
+set.seed(6812)
+downsampled_xgboost_start <- Sys.time()
+
+downsampled_xgboost_cv <- tune::fit_resamples(
+  downsampled_xgboost_workflow,
+  resamples = cv_folds,
+  metrics = classification_metrics,
+  control = tune::control_resamples(
+    save_pred = FALSE,
+    verbose = FALSE
+  )
+)
+
+downsampled_xgboost_runtime_seconds <- as.numeric(
+  difftime(Sys.time(), downsampled_xgboost_start, units = "secs")
+)
+
+downsampled_xgboost_fold_metrics <- tune::collect_metrics(
+  downsampled_xgboost_cv,
+  summarize = FALSE
+)
+
+downsampled_xgboost_results <- tibble::tibble(
+  mean_cv_roc_auc = mean(
+    downsampled_xgboost_fold_metrics$.estimate[
+      downsampled_xgboost_fold_metrics$.metric == "roc_auc"
+    ]
+  ),
+  roc_auc_sd = sd(
+    downsampled_xgboost_fold_metrics$.estimate[
+      downsampled_xgboost_fold_metrics$.metric == "roc_auc"
+    ]
+  ),
+  mean_cv_accuracy = mean(
+    downsampled_xgboost_fold_metrics$.estimate[
+      downsampled_xgboost_fold_metrics$.metric == "accuracy"
+    ]
+  ),
+  runtime_seconds = downsampled_xgboost_runtime_seconds
+)
+
+paired_roc_auc_differences <- xgboost_fold_metrics |>
+  filter(.metric == "roc_auc") |>
+  select(id, original_roc_auc = .estimate) |>
+  inner_join(
+    downsampled_xgboost_fold_metrics |>
+      filter(.metric == "roc_auc") |>
+      select(id, downsampled_roc_auc = .estimate),
+    by = "id"
+  ) |>
+  mutate(
+    roc_auc_difference = downsampled_roc_auc - original_roc_auc
+  )
+
+mean_paired_roc_auc_difference <- mean(
+  paired_roc_auc_differences$roc_auc_difference
+)
+
+imbalance_comparison <- bind_rows(
+  tibble::tibble(
+    model_configuration = "Original class distribution",
+    mean_cv_roc_auc = xgboost_results$mean_cv_roc_auc,
+    roc_auc_sd = xgboost_results$roc_auc_sd,
+    mean_cv_accuracy = xgboost_results$mean_cv_accuracy,
+    runtime_seconds = xgboost_results$runtime_seconds,
+    roc_auc_difference = 0
+  ),
+  tibble::tibble(
+    model_configuration = "Random downsampling",
+    mean_cv_roc_auc = downsampled_xgboost_results$mean_cv_roc_auc,
+    roc_auc_sd = downsampled_xgboost_results$roc_auc_sd,
+    mean_cv_accuracy = downsampled_xgboost_results$mean_cv_accuracy,
+    runtime_seconds = downsampled_xgboost_results$runtime_seconds,
+    roc_auc_difference = mean_paired_roc_auc_difference
+  )
+) |>
+  mutate(
+    runtime = sprintf("%.2f seconds", runtime_seconds)
+  ) |>
+  select(-runtime_seconds)
+
+paired_difference_text <- paste(
+  sprintf(
+    "%s: %+.4f",
+    paired_roc_auc_differences$id,
+    paired_roc_auc_differences$roc_auc_difference
+  ),
+  collapse = "; "
+)
+
+knitr::kable(
+  imbalance_comparison,
+  digits = 4,
+  caption = "XGBoost class-imbalance comparison"
+)
+```
+
+The paired fold ROC-AUC differences, calculated as downsampled minus original, are `r paired_difference_text`. Their mean is `r sprintf("%+.4f", mean_paired_roc_auc_difference)`. Mean ROC-AUC moves from `r sprintf("%.4f", xgboost_results$mean_cv_roc_auc)` to `r sprintf("%.4f", downsampled_xgboost_results$mean_cv_roc_auc)`, so downsampling `r if (mean_paired_roc_auc_difference > 0) "improves" else "does not improve"` average risk ranking in this run. The fold standard deviations describe each configuration's variation and are not confidence intervals for the paired difference.
+
+Mean accuracy moves from `r sprintf("%.4f", xgboost_results$mean_cv_accuracy)` to `r sprintf("%.4f", downsampled_xgboost_results$mean_cv_accuracy)` at the default 0.5 threshold. Accuracy remains a supporting metric because it depends on that threshold. Downsampling also changes the event prevalence seen during training, so its predicted probabilities should not be treated as calibrated to the original applicant population without a separate calibration step.
+
+## XGBoost Hyperparameter Tuning
+
+The randomized search evaluates 20 distinct XGBoost configurations on a reproducible stratified sample of approximately 5,000 development rows. Each configuration uses Feature Set C without downsampling and is assessed with three stratified folds. The search covers 100–500 trees, depths of 2–8, learning rates from 0.01 to 0.20, and minimum node sizes from 5–30. Learning rates are sampled on a log10 scale so the search does not concentrate on the upper end of the range.
+
+```{r}
+#| label: xgboost-tuning
+
+set.seed(6812)
+tuning_sample_split <- rsample::initial_split(
+  development,
+  prop = 5000 / nrow(development),
+  strata = TARGET
+)
+tuning_sample <- rsample::training(tuning_sample_split)
+
+set.seed(6812)
+tuning_folds <- rsample::vfold_cv(
+  tuning_sample,
+  v = 3,
+  strata = TARGET
+)
+
+tuned_xgboost_spec <- parsnip::boost_tree(
+  trees = tune::tune(),
+  tree_depth = tune::tune(),
+  learn_rate = tune::tune(),
+  min_n = tune::tune()
+) |>
+  parsnip::set_engine("xgboost") |>
+  parsnip::set_mode("classification")
+
+tuned_xgboost_workflow <- build_model_workflow(
+  tuning_sample,
+  financial_time_missing_predictors,
+  tuned_xgboost_spec
+)
+
+xgboost_parameter_set <- dials::parameters(
+  dials::trees(range = c(100L, 500L)),
+  dials::tree_depth(range = c(2L, 8L)),
+  dials::learn_rate(
+    range = c(log10(0.01), log10(0.20))
+  ),
+  dials::min_n(range = c(5L, 30L))
+)
+
+set.seed(6812)
+xgboost_random_grid <- dials::grid_random(
+  xgboost_parameter_set,
+  size = 20
+)
+
+stopifnot(
+  nrow(xgboost_random_grid) == 20,
+  nrow(distinct(xgboost_random_grid)) == 20
+)
+
+set.seed(6812)
+xgboost_tuning_start <- Sys.time()
+
+xgboost_tuning_results <- tune::tune_grid(
+  tuned_xgboost_workflow,
+  resamples = tuning_folds,
+  grid = xgboost_random_grid,
+  metrics = classification_metrics,
+  control = tune::control_grid(
+    save_pred = FALSE,
+    verbose = FALSE
+  )
+)
+
+xgboost_tuning_runtime_seconds <- as.numeric(
+  difftime(Sys.time(), xgboost_tuning_start, units = "secs")
+)
+
+xgboost_tuning_roc_auc <- tune::collect_metrics(
+  xgboost_tuning_results
+) |>
+  filter(.metric == "roc_auc") |>
+  arrange(desc(mean))
+
+evaluated_configuration_count <- n_distinct(
+  xgboost_tuning_roc_auc$.config
+)
+
+stopifnot(evaluated_configuration_count == 20)
+
+top_tuning_configurations <- xgboost_tuning_roc_auc |>
+  slice_head(n = 5) |>
+  select(
+    trees,
+    tree_depth,
+    learn_rate,
+    min_n,
+    mean_cv_roc_auc = mean
+  )
+
+best_tuning_parameters <- xgboost_tuning_roc_auc |>
+  slice_head(n = 1) |>
+  select(trees, tree_depth, learn_rate, min_n, .config)
+
+best_tuning_fold_metrics <- tune::collect_metrics(
+  xgboost_tuning_results,
+  summarize = FALSE
+) |>
+  filter(.config == best_tuning_parameters$.config)
+
+best_tuning_summary <- best_tuning_parameters |>
+  transmute(
+    trees,
+    tree_depth,
+    learn_rate,
+    min_n,
+    mean_cv_roc_auc = mean(
+      best_tuning_fold_metrics$.estimate[
+        best_tuning_fold_metrics$.metric == "roc_auc"
+      ]
+    ),
+    roc_auc_sd = sd(
+      best_tuning_fold_metrics$.estimate[
+        best_tuning_fold_metrics$.metric == "roc_auc"
+      ]
+    ),
+    mean_cv_accuracy = mean(
+      best_tuning_fold_metrics$.estimate[
+        best_tuning_fold_metrics$.metric == "accuracy"
+      ]
+    ),
+    runtime = sprintf("%.2f seconds", xgboost_tuning_runtime_seconds)
+  )
+
+knitr::kable(
+  top_tuning_configurations,
+  digits = 4,
+  caption = "Five highest-ranking XGBoost tuning configurations"
+)
+
+knitr::kable(
+  best_tuning_summary,
+  digits = 4,
+  caption = "Selected XGBoost tuning configuration"
+)
+```
+
+The tuning sample contains `r format(nrow(tuning_sample), big.mark = ",")` rows, and all `r evaluated_configuration_count` configurations were evaluated. The selected configuration uses `r best_tuning_summary$trees` trees, depth `r best_tuning_summary$tree_depth`, learning rate `r sprintf("%.4f", best_tuning_summary$learn_rate)`, and minimum node size `r best_tuning_summary$min_n`. Its mean tuning ROC-AUC is `r sprintf("%.4f", best_tuning_summary$mean_cv_roc_auc)` with a fold standard deviation of `r sprintf("%.4f", best_tuning_summary$roc_auc_sd)`; mean accuracy is `r sprintf("%.4f", best_tuning_summary$mean_cv_accuracy)`.
+
+These results select parameter values within the sampled search. They are not an independent estimate of final model performance and should not be compared directly with the full-development cross-validation results. The selected configuration is not refitted or evaluated again in this experiment.
+
+# Model Performance
+
+```{r}
+#| label: benchmark-comparison
+
+benchmark_comparison <- tibble::tibble(
+  model = c(
+    "Majority-class classifier",
+    "Ridge logistic regression",
+    "Ridge logistic regression",
+    "XGBoost",
+    "XGBoost with downsampling"
+  ),
+  predictor_set = c(
+    "No predictors",
+    paste(length(original_predictor_names), "original application predictors"),
+    paste(ridge_c_results$predictor_count, "Feature Set C predictors"),
+    paste(xgboost_results$predictor_count, "Feature Set C predictors"),
+    paste(length(financial_time_missing_predictors), "Feature Set C predictors")
+  ),
+  mean_cv_accuracy = c(
+    majority_summary$mean_cv[majority_summary$metric == "Accuracy"],
+    logistic_summary$mean_cv[logistic_summary$metric == "Accuracy"],
+    ridge_c_results$mean_cv_accuracy,
+    xgboost_results$mean_cv_accuracy,
+    downsampled_xgboost_results$mean_cv_accuracy
+  ),
+  mean_cv_roc_auc = c(
+    majority_summary$mean_cv[majority_summary$metric == "ROC-AUC"],
+    logistic_summary$mean_cv[logistic_summary$metric == "ROC-AUC"],
+    ridge_c_results$mean_cv_roc_auc,
+    xgboost_results$mean_cv_roc_auc,
+    downsampled_xgboost_results$mean_cv_roc_auc
+  ),
+  roc_auc_sd = c(
+    majority_summary$sd_cv[majority_summary$metric == "ROC-AUC"],
+    logistic_summary$sd_cv[logistic_summary$metric == "ROC-AUC"],
+    ridge_c_results$roc_auc_sd,
+    xgboost_results$roc_auc_sd,
+    downsampled_xgboost_results$roc_auc_sd
+  ),
+  runtime = c(
+    sprintf("%.2f seconds", majority_runtime_seconds),
+    sprintf("%.2f seconds", logistic_runtime_seconds),
+    sprintf("%.2f seconds", ridge_c_results$runtime_seconds),
+    sprintf("%.2f seconds", xgboost_results$runtime_seconds),
+    sprintf("%.2f seconds", downsampled_xgboost_results$runtime_seconds)
+  )
+)
+
+knitr::kable(
+  benchmark_comparison,
+  digits = 4,
+  caption = "Cross-validated benchmark comparison"
+)
+```
+
+The final model is fitted once on all labeled applications. The elapsed fit time is recorded here, and ROC-AUC is then calculated on the same observations used for training. This ROC-AUC measures in-sample performance, not performance on unseen data.
+
+```{r}
+#| label: final-xgboost-training-performance
+
+final_learn_rate <- best_tuning_parameters$learn_rate[[1]]
+
+final_xgboost_spec <- parsnip::boost_tree(
+  trees = 354,
+  tree_depth = 2,
+  learn_rate = final_learn_rate,
+  min_n = 26
+) |>
+  parsnip::set_engine("xgboost") |>
+  parsnip::set_mode("classification")
+
+final_xgboost_workflow <- build_model_workflow(
+  train,
+  financial_time_missing_predictors,
+  final_xgboost_spec
+)
+
+set.seed(6812)
+final_xgboost_runtime_seconds <- system.time({
+  final_xgboost_fit <- parsnip::fit(
+    final_xgboost_workflow,
+    data = train
+  )
+})[["elapsed"]]
+
+final_training_probabilities <- predict(
+  final_xgboost_fit,
+  new_data = train,
+  type = "prob"
+)
+
+final_training_roc_auc <- payment_roc_auc(
+  tibble::tibble(
+    TARGET = train$TARGET,
+    .pred_1 = final_training_probabilities$.pred_1
+  ),
+  truth = TARGET,
+  .pred_1
+) |>
+  dplyr::pull(.estimate)
+
+final_training_performance <- tibble::tibble(
+  measurement = c(
+    "Training ROC-AUC (in-sample)",
+    "Final model training runtime"
+  ),
+  value = c(
+    sprintf("%.5f", final_training_roc_auc),
+    sprintf("%.2f seconds", final_xgboost_runtime_seconds)
+  )
+)
+
+knitr::kable(
+  final_training_performance,
+  caption = "Final XGBoost training measurements"
+)
+```
+
+# Final Model and Test Predictions
+
+The final XGBoost model uses the selected tuning configuration and Feature Set C without downsampling. The fitted workflow from the Model Performance section is reused to generate test probabilities for `TARGET = 1`.
+
+```{r}
+#| label: final-xgboost-predictions
+
+final_test_probabilities <- predict(
+  final_xgboost_fit,
+  new_data = test,
+  type = "prob"
+)
+
+submission <- tibble::tibble(
+  SK_ID_CURR = test$SK_ID_CURR,
+  TARGET = final_test_probabilities$.pred_1
+)
+
+submission_path <- "../data/processed/home_credit_submission.csv"
+readr::write_csv(submission, submission_path)
+
+written_submission <- readr::read_csv(
+  submission_path,
+  show_col_types = FALSE
+)
+
+submission_checks <- tibble::tibble(
+  check = c(
+    "Row count matches prepared test data",
+    "Column names and order are correct",
+    "Application IDs retain their original order",
+    "TARGET contains finite probabilities from 0 to 1"
+  ),
+  passed = c(
+    nrow(written_submission) == nrow(test),
+    identical(names(written_submission), c("SK_ID_CURR", "TARGET")),
+    all(written_submission$SK_ID_CURR == test$SK_ID_CURR),
+    is.numeric(written_submission$TARGET) &&
+      !anyNA(written_submission$TARGET) &&
+      all(is.finite(written_submission$TARGET)) &&
+      all(dplyr::between(written_submission$TARGET, 0, 1))
+  )
+)
+
+stopifnot(all(submission_checks$passed))
+
+final_model_summary <- tibble::tibble(
+  training_rows = nrow(train),
+  prediction_rows = nrow(written_submission),
+  predictor_count = length(financial_time_missing_predictors),
+  trees = 354,
+  tree_depth = 2,
+  learn_rate = sprintf("%.10f", final_learn_rate),
+  min_n = 26
+)
+
+knitr::kable(
+  final_model_summary,
+  caption = "Final XGBoost training and prediction summary"
+)
+
+knitr::kable(
+  submission_checks,
+  caption = "Submission-file validation"
+)
+```
+
+The submission contains `r format(nrow(written_submission), big.mark = ",")` rows in the same order as the prepared test data. Its `TARGET` column contains event probabilities rather than class predictions.
+
+The submission received a public ROC-AUC of 0.72388.
+
+# Results and Business Implications
+Among the candidate models, XGBoost achieved the highest mean cross-validated ROC-AUC (0.7535), and downsampling did not improve its performance. The business value of this model lies in its ability to distinguish applicants with different levels of repayment risk. A public ROC-AUC of 0.72388 means that, for a randomly selected pair of applicants with different repayment outcomes, the model ranks the applicant who defaults as higher risk approximately 72% of the time. This provides a meaningful improvement over the majority-class benchmark, which cannot distinguish between applicants.
+
+For Home Credit, this ranking could help underwriters prioritize higher-risk applications for additional review while identifying lower-risk applicants who may lack traditional credit histories. This supports the company's goal of expanding access to credit without overlooking repayment risk. However, the results do not establish which applicants should be approved or rejected. That decision would require evaluating the financial consequences of defaults against the cost of rejecting borrowers who would have repaid their loans.

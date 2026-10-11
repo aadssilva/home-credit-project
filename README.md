@@ -95,6 +95,10 @@ Final dimensions:
 
 Generated files under `data/processed/` are excluded from Git because they can be reproduced by running the preparation script.
 
-### Statistical Analysis:
+## Modeling
 
-Model development and evaluation will be added in the next stage of the project.
+The modeling analysis is documented in [`02_modeling.qmd`](notebooks/02_modeling.qmd). The models evaluated include a majority-class baseline, ridge logistic regression with different feature sets, and XGBoost. Threefold cross-validation was used to compare performance, with ROC-AUC as the primary metric given the class imbalance.
+
+The majority-class baseline achieved an ROC-AUC of 0.50. Ridge logistic regression ranged from 0.7433 to 0.7460, while XGBoost achieved the highest mean cross-validated ROC-AUC of 0.7535. Downsampling was also tested, but slightly reduced XGBoost's ROC-AUC to 0.7512.
+
+XGBoost was selected for the final model based on its cross-validation performance. Hyperparameters were tuned via a randomized search over 20 configurations, using 5,000 observations and three-fold cross-validation. The final model was trained on all 307,511 labeled applications and achieved a public test ROC-AUC of 0.72388.
