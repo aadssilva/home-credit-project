@@ -21,3 +21,16 @@ _freeze/
 *submission*.csv
 *.rds
 *.rda
+
+# Local-only coursework
+docs/BusinessStatement.md
+docs/HomeCredit_columns_description.csv
+docs/data_map.md
+docs/eda_plan.md
+docs/feature_report.md
+notebooks/01_eda.qmd
+scripts/03_model_card.R
+scripts/04_threshold_sweep.R
+scripts/05_financial_threshold_analysis.R
+scripts/06_shap_analysis.R
+scripts/07_fairness_analysis.R
