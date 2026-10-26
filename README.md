@@ -12,7 +12,7 @@ While Home Credit is currently using various statistical and machine learning me
 
 ## Methodology:
 
-The project follows a analytics workflow:
+The project follows an analytics workflow:
 
 1. Define the business problem and project scope.
 2. Explore the application data and document data-quality issues and relevant patterns.
@@ -101,4 +101,10 @@ The modeling analysis is documented in [`02_modeling.qmd`](notebooks/02_modeling
 
 The majority-class baseline achieved an ROC-AUC of 0.50. Ridge logistic regression ranged from 0.7433 to 0.7460, while XGBoost achieved the highest mean cross-validated ROC-AUC of 0.7535. Downsampling was also tested, but slightly reduced XGBoost's ROC-AUC to 0.7512.
 
-XGBoost was selected for the final model based on its cross-validation performance. Hyperparameters were tuned via a randomized search over 20 configurations, using 5,000 observations and three-fold cross-validation. The final model was trained on all 307,511 labeled applications and achieved a public test ROC-AUC of 0.72388.
+Based on cross-validation results, the original XGBoost model (Feature Set C, without hyperparameter tuning) was selected. It achieved ROC-AUC scores of 0.7535 in cross-validation, 0.7576 on the holdout set, 0.74203 on Kaggle Public, and 0.74116 on Kaggle Private. A tuned version was also tested, but it performed worse and was not selected.
+
+## Model Card
+
+The [Model Card](notebooks/model_card.qmd) summarizes the selected model's performance, business value, and limitations. We evaluated different approval thresholds and selected 0.10 based on the highest estimated financial benefit under our assumptions.
+
+The report also includes SHAP explanations, fairness comparisons by gender and education, and limitations that should be addressed before deployment. Based on these findings, the model is not recommended for automated credit decisions without further validation.

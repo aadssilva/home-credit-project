@@ -1,37 +1,23 @@
-# Home Credit raw datasets
 data/raw/*
 !data/raw/.gitkeep
-
-# Generated/processed datasets
 data/processed/*
 !data/processed/.gitkeep
 
-# R session files
+*.html
+*_files/
+*.knit.md
+notebooks/02_modeling.rmarkdown
+.quarto/
+_freeze/
+
 .Rhistory
 .Rapp.history
 .RData
 .Ruserdata
-
-# Quarto generated/cache files
-.quarto/
-_freeze/
-
-# macOS
 .DS_Store
 
-# Environment / credentials
 .env
 .env.*
-
-# Quarto rendered outputs
-*.html
-*_files/
-
-# Quarto intermediate files
-*.knit.md
-notebooks/02_modeling.rmarkdown
-
-# Kaggle submissions and saved models
 *submission*.csv
 *.rds
 *.rda
