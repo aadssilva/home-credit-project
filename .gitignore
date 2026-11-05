@@ -22,13 +22,13 @@ _freeze/
 *.rds
 *.rda
 
-# Local-only coursework
-docs/BusinessStatement.md
+# Local only
+#docs/BusinessStatement.md
 docs/HomeCredit_columns_description.csv
-docs/data_map.md
-docs/eda_plan.md
-docs/feature_report.md
-notebooks/01_eda.qmd
+#docs/data_map.md
+#docs/eda_plan.md
+#docs/feature_report.md
+#notebooks/01_eda.qmd
 scripts/03_model_card.R
 scripts/04_threshold_sweep.R
 scripts/05_financial_threshold_analysis.R
