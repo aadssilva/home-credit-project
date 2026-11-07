@@ -21,9 +21,9 @@ execute:
 
 # Introduction
 
-Home Credit needs to rank applicants by their likelihood of payment difficulty while balancing portfolio risk with access to credit. This notebook compares candidate classifiers using ROC-AUC, tunes the selected XGBoost model, and generates predicted probabilities for the competition test set.
+Home Credit needs to identify applicants who are more likely to experience payment difficulties while maintaining access to credit. In this notebook, I compare different classification models, evaluate their performance using ROC-AUC, and test hyperparameter tuning with XGBoost.
 
-This notebook begins with the prepared application-level datasets produced by `scripts/01_data_preparation.R`. It uses cross-validation to establish initial performance benchmarks before evaluating additional modeling approaches. The unlabeled application test data remain reserved for final scoring.
+The analysis uses the prepared application datasets from scripts/01_data_preparation.R. I use cross-validation for model comparison and reserve the competition test data for the final submission.
 
 ```{r}
 #| label: setup
@@ -174,9 +174,9 @@ knitr::kable(
 )
 ```
 
-`TARGET` is ordered with `1` as the first factor level, and the ROC-AUC metric explicitly uses `event_level = "first"`. Accuracy is available for the baseline, but ROC-AUC is the primary comparison metric because the payment-difficulty outcome is imbalanced.
+I use ROC-AUC as the main metric because only about 8% of applicants have TARGET = 1. Accuracy is also reported for comparison.
 
-The prepared `annuity_income_quintile` was calculated from thresholds learned on the full training dataset. During cross-validation, this column must either be excluded or recreated from each analysis fold so that assessment rows do not influence its cut points. No change is made at this stage.
+I exclude annuity_income_quintile from modeling because its thresholds were calculated using the full training dataset. Keeping it would introduce information from the assessment folds into cross-validation.
 
 # Model Experiments
 
@@ -472,7 +472,7 @@ knitr::kable(
 )
 ```
 
-Feature set B changes mean ROC-AUC by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[2])` relative to the original predictors. Feature set C improves on B by `r sprintf("%+.4f", engineered_comparison$mean_cv_roc_auc[3] - engineered_comparison$mean_cv_roc_auc[2])` and on A by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[3])`. These are small descriptive gains. The fold standard deviations describe variation in each model's scores, not uncertainty in the paired differences, so they do not establish statistical significance or the contribution of any single engineered variable.
+Feature set B changes mean ROC-AUC by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[2])` relative to the original predictors. Feature set C improves on B by `r sprintf("%+.4f", engineered_comparison$mean_cv_roc_auc[3] - engineered_comparison$mean_cv_roc_auc[2])` and on A by `r sprintf("%+.4f", engineered_comparison$roc_auc_difference[3])`. The improvements are relatively small. They show how the feature sets performed together, but do not tell us how much each engineered variable contributed individually.
 
 ## XGBoost Comparison
 
@@ -555,7 +555,7 @@ knitr::kable(
 )
 ```
 
-XGBoost reaches a mean ROC-AUC of `r sprintf("%.4f", xgboost_results$mean_cv_roc_auc)` and mean accuracy of `r sprintf("%.4f", xgboost_results$mean_cv_accuracy)`. Its ROC-AUC is `r sprintf("%+.4f", xgboost_roc_auc_difference)` relative to ridge logistic regression on the same predictors. This comparison isolates the algorithm change within the current design. With three folds and one fixed XGBoost configuration, the result is descriptive rather than evidence of a statistically significant difference.
+XGBoost reaches a mean ROC-AUC of `r sprintf("%.4f", xgboost_results$mean_cv_roc_auc)` and mean accuracy of `r sprintf("%.4f", xgboost_results$mean_cv_accuracy)`. Its ROC-AUC is `r sprintf("%+.4f", xgboost_roc_auc_difference)` relative to ridge logistic regression on the same predictors. Since the predictors, preprocessing, and cross-validation folds are the same, this comparison shows how XGBoost performed against ridge logistic regression under the same conditions.
 
 ## Class Imbalance Comparison
 
@@ -670,9 +670,9 @@ knitr::kable(
 )
 ```
 
-The paired fold ROC-AUC differences, calculated as downsampled minus original, are `r paired_difference_text`. Their mean is `r sprintf("%+.4f", mean_paired_roc_auc_difference)`. Mean ROC-AUC moves from `r sprintf("%.4f", xgboost_results$mean_cv_roc_auc)` to `r sprintf("%.4f", downsampled_xgboost_results$mean_cv_roc_auc)`, so downsampling `r if (mean_paired_roc_auc_difference > 0) "improves" else "does not improve"` average risk ranking in this run. The fold standard deviations describe each configuration's variation and are not confidence intervals for the paired difference.
+Downsampling did not improve the average ROC-AUC in this experiment. Accuracy also decreased substantially at the default 0.5 threshold. Although the training sample became balanced, the evaluation still used the original class distribution.
 
-Mean accuracy moves from `r sprintf("%.4f", xgboost_results$mean_cv_accuracy)` to `r sprintf("%.4f", downsampled_xgboost_results$mean_cv_accuracy)` at the default 0.5 threshold. Accuracy remains a supporting metric because it depends on that threshold. Downsampling also changes the event prevalence seen during training, so its predicted probabilities should not be treated as calibrated to the original applicant population without a separate calibration step.
+I would not assume that probabilities from the downsampled model are calibrated to the original applicant population.
 
 ## XGBoost Hyperparameter Tuning
 
@@ -1014,6 +1014,8 @@ The submission contains `r format(nrow(written_submission), big.mark = ",")` row
 The submission received a public ROC-AUC of 0.72388.
 
 # Results and Business Implications
-Among the candidate models, XGBoost achieved the highest mean cross-validated ROC-AUC (0.7535), and downsampling did not improve its performance. The business value of this model lies in its ability to distinguish applicants with different levels of repayment risk. A public ROC-AUC of 0.72388 means that, for a randomly selected pair of applicants with different repayment outcomes, the model ranks the applicant who defaults as higher risk approximately 72% of the time. This provides a meaningful improvement over the majority-class benchmark, which cannot distinguish between applicants.
+Among the models tested, the original XGBoost achieved the highest mean cross-validated ROC-AUC (0.7535). Downsampling did not improve its performance, and the hyperparameter tuning exercise produced a different configuration, which scored 0.72388 on the Kaggle public leaderboard.
 
-For Home Credit, this ranking could help underwriters prioritize higher-risk applications for additional review while identifying lower-risk applicants who may lack traditional credit histories. This supports the company's goal of expanding access to credit without overlooking repayment risk. However, the results do not establish which applicants should be approved or rejected. That decision would require evaluating the financial consequences of defaults against the cost of rejecting borrowers who would have repaid their loans.
+These results show that the application data contains useful information for ranking applicants by repayment risk. They also show that tuning a model does not necessarily improve its performance.
+
+For Home Credit, a model like this could help identify higher-risk applications for additional review while keeping opportunities open for applicants with limited credit histories. However, the results alone are not enough to decide who should receive a loan. That would require considering the financial consequences of incorrect approvals and rejections, not just the model's ROC-AUC.

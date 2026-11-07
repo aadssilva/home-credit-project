@@ -1,36 +1,31 @@
+# Data
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 
+# Generated files
 *.html
 *_files/
 *.knit.md
-notebooks/02_modeling.rmarkdown
+*.quarto_ipynb
 .quarto/
 _freeze/
+*.rd[as]
+*submission*.csv
 
+# Local environment
 .Rhistory
 .Rapp.history
 .RData
 .Ruserdata
 .DS_Store
-
 .env
 .env.*
-*submission*.csv
-*.rds
-*.rda
 
-# Local only
-#docs/BusinessStatement.md
+# Local-only project files
 docs/HomeCredit_columns_description.csv
-#docs/data_map.md
-#docs/eda_plan.md
-#docs/feature_report.md
-#notebooks/01_eda.qmd
-scripts/03_model_card.R
-scripts/04_threshold_sweep.R
-scripts/05_financial_threshold_analysis.R
-scripts/06_shap_analysis.R
-scripts/07_fairness_analysis.R
+notebooks/01_eda_old.qmd
+notebooks/02_modeling.rmarkdown
+notebooks/.gitignore
+/scripts/0[3-7]_*.R

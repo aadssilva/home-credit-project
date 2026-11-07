@@ -14,21 +14,17 @@ execute:
 
 # Executive summary
 
-Home Credit aims to expand credit access for people with limited credit histories while keeping lending risk under control. This project evaluates an XGBoost model trained on historical application data to predict payment difficulty and support credit approval decisions.
+Home Credit aims to expand access to credit for people with limited credit histories while keeping lending risk under control. This project evaluates an XGBoost model to predict payment difficulty and support credit approval decisions.
 
-The selected model achieved a cross-validated ROC-AUC of 0.7535 and a holdout ROC-AUC of 0.7576. These results suggest that the model can reasonably distinguish between higher- and lower-risk applicants.
+The selected model achieved a ROC-AUC of 0.7535 in cross-validation and 0.7576 on the holdout set. I also tested different approval thresholds to evaluate their financial implications. Under the assumptions used, a threshold of 0.10 resulted in a 73.8% approval rate and 43.5% higher simulated net benefit compared with a threshold of 0.50.
 
-To evaluate its business value, we tested different approval thresholds using estimated lending gains and losses. A threshold of 0.10 produced the highest estimated net benefit. On the holdout data, this policy approved 73.8% of applicants, with a 4.32% payment-difficulty rate among approved borrowers. Compared with the standard 0.50 threshold, the estimated financial benefit increased by 43.5%. This is a simulation based on historical data and assumed costs, not actual profit.
-
-The analysis also identified some important limitations. External risk scores were the strongest predictors, but their underlying definitions are unknown. The model also relies on sensitive attributes, including gender, and approval rates differed across gender and education groups. Some model predictions could not be translated into sufficiently specific reasons for credit denial.
-
-Given these findings, I would not recommend automated deployment at this stage. The model could be considered for a limited, supervised pilot after reviewing sensitive predictors, validating financial assumptions and probability calibration, and improving the explanations provided for declined applications.
+However, the analysis also raised concerns about sensitive predictors, differences in approval rates across applicant groups, and the explanations available for credit denial. Given these limitations, I would not recommend automated deployment without further validation and review.
 
 # Model details
 
 The selected model is an XGBoost classifier using Feature Set C, with 132 application-level predictors, including the features developed during data preparation.
 
-We selected the original XGBoost configuration after comparing it with the tuned alternative, which showed lower cross-validation performance.
+I selected the original XGBoost configuration because it performed better than the tuned version in cross-validation.
 
 | Parameter | Value |
 |---|---|
@@ -42,7 +38,7 @@ We selected the original XGBoost configuration after comparing it with the tuned
 
 The model uses median imputation for missing numeric values, dummy encoding for categorical variables, and removal of zero-variance predictors.
 
-We used 246,008 applications for model development and reserved 61,503 for holdout evaluation. After selecting the model, we trained the final version on all 307,511 labeled applications.
+I used 246,008 applications for model development and reserved 61,503 for holdout evaluation. After selecting the model, I trained the final version on all 307,511 labeled applications.
 
 # Intended use
 
@@ -62,8 +58,6 @@ Data preparation included correcting documented invalid values, converting age a
 
 # Performance metrics
 
-The selected XGBoost model achieved a mean ROC-AUC of 0.7535 in three-fold cross-validation and 0.7576 on the holdout dataset. The Kaggle public and private scores were 0.7420 and 0.7412, respectively, showing reasonably consistent performance across the evaluations.
-
 | Evaluation | Metric | Result |
 |---|---|---:|
 | Cross-validation (3 folds) | ROC-AUC | 0.7535 |
@@ -73,13 +67,13 @@ The selected XGBoost model achieved a mean ROC-AUC of 0.7535 in three-fold cross
 | Holdout (threshold = 0.10) | Precision | 18.33% |
 | Holdout (threshold = 0.10) | Recall | 60.13% |
 
-At the selected threshold, the model identified about 60% of applicants who experienced payment difficulty. However, only 18.33% of those flagged actually experienced this outcome.
+At the selected threshold of 0.10, the model identified about 60% of applicants who experienced payment difficulty. However, only 18.33% of the flagged applicants had this outcome.
 
-These results suggest that the model can distinguish between applicants with different risk levels, although its predictions are not sufficiently accurate to support automatic rejection decisions without further review.
+The ROC-AUC results show that the model can distinguish applicants with different risk levels, but this performance alone is not enough to support automatic rejection decisions.
 
 # Decision threshold
 
-We evaluated approval thresholds from 0.01 to 0.50 to find the level that maximizes estimated financial benefit.
+I tested approval thresholds from 0.01 to 0.50 to find which one produced the highest estimated financial benefit.
 
 The analysis used a median gross spread of 10.62%, calculated from Home Credit application data, and an assumed recovery rate of 13.5%, based on two-year recoveries of charged-off U.S. credit card debt reported by the CFPB (2025). These assumptions represent simplified lending economics, not Home Credit's actual profit and loss figures.
 
@@ -93,7 +87,7 @@ A threshold of 0.10 produced the highest estimated net benefit using out-of-fold
 
 Under these assumptions, the selected threshold increased estimated net benefit by 43.5% compared with 0.50.
 
-We also tested different financial scenarios by varying the estimated gain and recovery rates. The preferred threshold ranged from 0.08 to 0.14, suggesting some consistency within the assumptions tested.
+I also tested different gain and recovery assumptions. The selected thresholds ranged from 0.08 to 0.14 across these scenarios.
 
 ```{r}
 #| label: financial-sensitivity-table
@@ -110,7 +104,7 @@ These financial results are simulations expressed in dataset monetary units. The
 
 # Explanations and adverse action mapping
 
-We used SHAP to explain the model's predictions on a random sample of 1,000 applicants. The three external risk scores (`EXT_SOURCE_1`, `EXT_SOURCE_2`, and `EXT_SOURCE_3`) were the strongest predictors. Lower scores generally increased estimated payment risk. Employment tenure and loan characteristics also influenced the predictions.
+I used SHAP to examine the model's predictions for 1,000 randomly selected applicants from the competition test data. The three external scores were the strongest predictors, with lower scores generally associated with higher predicted risk. Employment tenure and loan characteristics also contributed to the predictions.
 
 ![SHAP summary for 1,000 test applicants. Positive contributions increase predicted payment-difficulty risk; values are in log-odds, not percentage points.](assets/model_card/shap_summary.png)
 
@@ -148,19 +142,15 @@ We evaluated approval rates by gender and education level using the 61,503 holdo
 
 Men had a 15.33 percentage-point lower approval rate than women, and their false-decline rate was also higher (32.75% versus 18.44%). Applicants with incomplete higher and lower secondary education had approval ratios below the 0.80 screening reference.
 
-These differences do not establish discrimination, but they deserve further investigation. The 80% rule is used here as a descriptive screening measure, not a legal compliance test. Results for small groups, particularly applicants with an academic degree (n = 33), should be interpreted cautiously.
+These explanations are useful for understanding the model, but they are not ready to be used as credit denial reasons. The external scores lack clear definitions, and goods price alone does not establish repayment capacity. SHAP also explains how the model reached its prediction, not what caused the applicant's payment difficulty.
 
 Another concern is that gender ranked sixth in SHAP feature importance. The use of sensitive attributes and the observed approval disparities would need to be reviewed before considering deployment.
 
 # Limitations and risks
 
-The model was developed using historical Home Credit application data and may not reflect current lending conditions. It also uses only application-level information, leaving out additional credit-history tables and some measures of repayment capacity, such as existing debt obligations and living expenses.
+The model was developed using historical application data and may not reflect current lending conditions. It also excludes the supplementary credit-history tables and does not capture all existing debt obligations or household expenses. Another limitation is that probability calibration has not yet been verified.
 
-The financial analysis relies on simplified assumptions about lending gains and losses. Since `TARGET` measures payment difficulty rather than actual financial loss, the estimated net benefit should not be interpreted as expected profit. Probability calibration also remains unverified.
-
-The model uses sensitive attributes, including gender, and shows differences in approval rates across demographic groups. In addition, the limited information about external risk scores makes some credit denial explanations difficult to justify.
-
-Before deployment, I would recommend reviewing sensitive predictors, validating financial assumptions and probability calibration, and improving the explanations for rejected applications. Model performance and approval disparities would also need continued monitoring.
+The financial results depend on simplified assumptions, and TARGET represents payment difficulty rather than actual financial losses. Before considering deployment, I would review the sensitive predictors, validate the financial assumptions, improve credit denial explanations, and test the model under current lending conditions.
 
 # References
 

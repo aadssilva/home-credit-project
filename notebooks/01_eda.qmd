@@ -1,0 +1,842 @@
+---
+title: "Home Credit Default Risk — Exploratory Data Analysis"
+author: "Anderson Silva"
+date: "2026-09-20"
+format:
+  html:
+    toc: true
+    toc-title: "Contents"
+    toc-depth: 3
+    code-fold: false
+    code-overflow: wrap
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Business Problem
+
+Home Credit needs to identify applicants who are more likely to have payment difficulty. Approving higher-risk applicants can increase credit losses. Rejecting applicants who could repay can limit access to credit and reduce potential business value. `TARGET = 1` means observed payment difficulty, and `TARGET = 0` means no observed payment difficulty.
+
+I will use supervised classification and decision thresholds in later stages. Here, I explore the application data, check data quality, and compare applicant characteristics with payment difficulty. I use these findings to guide data preparation.
+
+I use `application_train.csv` and `application_test.csv`. I have not joined the supplementary Home Credit tables, so this analysis cannot measure full credit-file depth, past repayment behavior, or true thin-file status.
+
+# Questions
+
+The EDA is organized around six data-integrity questions and five business questions. The final business question summarizes the strongest descriptive associations found in the earlier sections.
+
+1. Is the target distribution sufficiently represented for EDA and later modeling?
+2. Is missingness related to the observed payment-difficulty outcome?
+3. Are there impossible, undocumented, or implausible values that require a data-preparation decision?
+4. Do the two application tables have the expected grain, keys, and duplicate structure?
+5. Do relative-time variables follow the direction described in the data dictionary?
+6. Are the train and test application tables structurally and distributionally consistent enough for a common modeling workflow?
+7. Is payment difficulty associated with application-level proxies for the burden of the proposed loan relative to reported income?
+8. How well do the external risk scores distinguish applicants who experience payment difficulty from those who do not?
+9. Is greater recent credit-seeking activity associated with higher payment difficulty?
+10. Which available indicators of income level/source and current employment context or tenure are associated with payment difficulty?
+11. Which applicant characteristics are most strongly associated with payment difficulty?
+
+```{r}
+#| label: setup
+
+# Packages for data summaries and plots.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Keep large numbers readable.
+options(scipen = 999)
+
+# Load the application tables and data dictionary.
+train <- read.csv("../data/raw/application_train.csv")
+test <- read.csv("../data/raw/application_test.csv")
+dictionary <- read.csv("../docs/HomeCredit_columns_description.csv")
+```
+
+# Data description
+
+Each row in the two application tables represents one current loan application, identified by `SK_ID_CURR`. Only the training table contains `TARGET`. The IDs are unique within each table and do not overlap between tables. I keep the two samples separate.
+
+```{r}
+# Check table sizes and application IDs.
+data_structure <- data.frame(
+  table = c("application_train.csv", "application_test.csv"),
+  rows = c(nrow(train), nrow(test)),
+  columns = c(ncol(train), ncol(test)),
+  unique_SK_ID_CURR = c(length(unique(train$SK_ID_CURR)),
+                        length(unique(test$SK_ID_CURR))),
+  duplicated_keys = c(sum(duplicated(train$SK_ID_CURR)),
+                      sum(duplicated(test$SK_ID_CURR))),
+  TARGET_present = c("Yes", "No")
+)
+
+knitr::kable(data_structure, caption = "Application-table structure")
+```
+
+For the analysis, I grouped the application columns by the type of information they represent.
+
+| Column group | Examples | Role in this EDA |
+|---|---|---|
+| Identifier and outcome | `SK_ID_CURR`, `TARGET` | Application key and observed payment-difficulty outcome |
+| Loan and income amounts | `AMT_INCOME_TOTAL`, `AMT_CREDIT`, `AMT_ANNUITY`, `AMT_GOODS_PRICE` | Proposed-loan burden relative to reported income |
+| Applicant and household | `DAYS_BIRTH`, `CNT_CHILDREN`, `CNT_FAM_MEMBERS`, `NAME_FAMILY_STATUS`, `NAME_EDUCATION_TYPE` | Basic applicant profile |
+| Income and employment | `NAME_INCOME_TYPE`, `DAYS_EMPLOYED`, `OCCUPATION_TYPE`, `ORGANIZATION_TYPE` | Current income and employment context |
+| External risk scores | `EXT_SOURCE_1`, `EXT_SOURCE_2`, `EXT_SOURCE_3` | External normalized risk information |
+| Housing and property | `NAME_HOUSING_TYPE`, `FLAG_OWN_REALTY`, building `*_AVG`, `*_MODE`, `*_MEDI` fields | Housing and building information |
+| Contact, region, and documents | `FLAG_*`, `REG_*`, `LIVE_*`, `REGION_RATING_*`, `FLAG_DOCUMENT_*` | Contact, location, and application-document information |
+| Bureau inquiries | `AMT_REQ_CREDIT_BUREAU_*` | Recent credit-seeking activity |
+
+The data map shows a few differences between the dictionary and the data. The dictionary does not document `DAYS_EMPLOYED = 365243`. `CODE_GENDER` contains `XNA`, and the test set has one `REGION_RATING_CLIENT_W_CITY = -1`. Four building `*_MODE` fields contain categories, although the dictionary describes them as normalized information. It also lists `TARGET` under `application_{train|test}`, even though the test table correctly has no target.
+
+# Data integrity
+
+## 1. Target distribution
+
+**Question:** Is the target distribution sufficiently represented for EDA and later modeling?
+
+```{r}
+# Calculate the share of each TARGET outcome.
+target_distribution <- train |>
+  count(TARGET, name = "n") |>
+  mutate(percent = n / nrow(train) * 100)
+
+knitr::kable(
+  target_distribution,
+  digits = 2,
+  caption = "TARGET distribution in application_train"
+)
+
+ggplot(target_distribution,
+       aes(x = factor(TARGET), y = percent)) +
+  geom_col() +
+  labs(
+    title = "Distribution of the observed payment-difficulty outcome",
+    x = "TARGET",
+    y = "Applicants (%)"
+  ) +
+  theme_minimal()
+```
+
+About 8% of training applications have `TARGET = 1`. There are enough cases for EDA, but the classes are imbalanced. I would preserve their proportions during validation and evaluate ROC-AUC and threshold tradeoffs alongside accuracy. These measures fit the Business Problem Statement (BPS).
+
+## 2. Missingness and `TARGET`
+
+**Question:** Is missingness related to the observed payment-difficulty outcome?
+
+```{r}
+# Count missing values in each column.
+missing_summary <- data.frame(
+  variable = names(train),
+  missing_n = colSums(is.na(train))
+) |>
+  mutate(missing_pct = missing_n / nrow(train) * 100) |>
+  filter(missing_n > 0) |>
+  arrange(desc(missing_pct))
+
+knitr::kable(
+  head(missing_summary, 15),
+  digits = 2,
+  caption = "Columns with the highest missingness",
+  row.names = FALSE
+)
+```
+
+```{r}
+# Compare TARGET rates when a column is missing or present.
+# Keep columns with at least 1,000 applications in each group.
+missing_vars <- missing_summary |>
+  filter(missing_n >= 1000, nrow(train) - missing_n >= 1000) |>
+  arrange(match(variable, names(train))) |>
+  pull(variable)
+
+missing_target <- bind_rows(lapply(missing_vars, function(v) {
+  missing <- is.na(train[[v]])
+
+  data.frame(
+    variable = v,
+    missing_n = sum(missing),
+    present_n = sum(!missing),
+    missing_pct = mean(missing) * 100,
+    target_rate_missing = mean(train$TARGET[missing]) * 100,
+    target_rate_present = mean(train$TARGET[!missing]) * 100,
+    difference_pp = (
+      mean(train$TARGET[missing]) - mean(train$TARGET[!missing])
+    ) * 100
+  )
+})) |>
+  arrange(desc(abs(difference_pp)))
+
+knitr::kable(
+  head(missing_target, 15),
+  digits = 2,
+  caption = "Largest stable TARGET-rate differences for missing versus present values"
+)
+```
+
+For some variables, missing values are associated with `TARGET`. Each of the six bureau-inquiry fields has 13.5% missing values. These applicants have a higher payment-difficulty rate than those with inquiry data. Dropping every incomplete row would remove potentially useful cases. The preparation workflow keeps missingness indicators for external scores and bureau inquiries. I leave the other missing-data decisions for modeling.
+
+## 3. Invalid and implausible values
+
+**Question:** Are there impossible, undocumented, or implausible values that require a data-preparation decision?
+
+```{r}
+# List values missing from or inconsistent with the dictionary.
+dictionary_issues <- data.frame(
+  table = c(
+    "train", "test", "test", "train",
+    "train/test", "train/test", "train/test", "train/test"
+  ),
+  variable = c(
+    "DAYS_EMPLOYED", "DAYS_EMPLOYED",
+    "REGION_RATING_CLIENT_W_CITY", "CODE_GENDER",
+    "FONDKAPREMONT_MODE", "HOUSETYPE_MODE",
+    "WALLSMATERIAL_MODE", "EMERGENCYSTATE_MODE"
+  ),
+  finding = c(
+    paste(sum(train$DAYS_EMPLOYED == 365243, na.rm = TRUE), "rows = 365243"),
+    paste(sum(test$DAYS_EMPLOYED == 365243, na.rm = TRUE), "rows = 365243"),
+    paste(sum(test$REGION_RATING_CLIENT_W_CITY == -1, na.rm = TRUE), "row = -1"),
+    paste(sum(train$CODE_GENDER == "XNA", na.rm = TRUE), "rows = XNA"),
+    "Categorical values although described as normalized information",
+    "Categorical values although described as normalized information",
+    "Categorical values although described as normalized information",
+    "Categorical values although described as normalized information"
+  )
+)
+
+knitr::kable(dictionary_issues, caption = "Dictionary conflicts and undocumented values")
+```
+
+```{r}
+# Flag large values for review; keep the rows.
+annuity_income <- train$AMT_ANNUITY / train$AMT_INCOME_TOTAL
+credit_income <- train$AMT_CREDIT / train$AMT_INCOME_TOTAL
+
+extreme_values <- data.frame(
+  check = c(
+    "Reported income",
+    "Annuity / income",
+    "Credit / income",
+    "Quarterly bureau inquiries",
+    "Annual bureau inquiries",
+    "Children count",
+    "Family-member count"
+  ),
+  observed_max = c(
+    max(train$AMT_INCOME_TOTAL, na.rm = TRUE),
+    max(annuity_income, na.rm = TRUE),
+    max(credit_income, na.rm = TRUE),
+    max(train$AMT_REQ_CREDIT_BUREAU_QRT, na.rm = TRUE),
+    max(train$AMT_REQ_CREDIT_BUREAU_YEAR, na.rm = TRUE),
+    max(train$CNT_CHILDREN, na.rm = TRUE),
+    max(train$CNT_FAM_MEMBERS, na.rm = TRUE)
+  ),
+  rows_flagged = c(
+    sum(train$AMT_INCOME_TOTAL >= 10000000, na.rm = TRUE),
+    sum(annuity_income > 1, na.rm = TRUE),
+    sum(credit_income > 20, na.rm = TRUE),
+    sum(train$AMT_REQ_CREDIT_BUREAU_QRT > 20, na.rm = TRUE),
+    sum(train$AMT_REQ_CREDIT_BUREAU_YEAR > 20, na.rm = TRUE),
+    sum(train$CNT_CHILDREN > 10, na.rm = TRUE),
+    sum(train$CNT_FAM_MEMBERS > 10, na.rm = TRUE)
+  )
+)
+
+knitr::kable(extreme_values, digits = 3, caption = "Values flagged for source verification")
+```
+
+`DAYS_EMPLOYED = 365243` cannot be a real employment duration. I would set it to missing before calculating tenure. I would also treat the test-set region rating of `-1` and `CODE_GENDER = XNA` as invalid or unknown, and keep the four building `*_MODE` fields categorical. I retain extreme income values, burden ratios, inquiry counts, and household counts unless there is evidence that they are invalid. A large value alone is not a reason to remove a row.
+
+## 4. Keys, duplicates, and grain
+
+**Question:** Do the two application tables have the expected grain, keys, and duplicate structure?
+
+```{r}
+# Check key uniqueness and overlap between samples.
+key_check <- data.frame(
+  table = c("application_train", "application_test"),
+  rows = c(nrow(train), nrow(test)),
+  unique_keys = c(n_distinct(train$SK_ID_CURR),
+                  n_distinct(test$SK_ID_CURR)),
+  duplicate_keys = c(sum(duplicated(train$SK_ID_CURR)),
+                     sum(duplicated(test$SK_ID_CURR)))
+)
+
+shared_ids <- length(intersect(train$SK_ID_CURR, test$SK_ID_CURR))
+
+knitr::kable(key_check, caption = "Primary-key check")
+cat("Shared SK_ID_CURR values between train and test:", shared_ids)
+```
+
+Both tables have one row per application and unique `SK_ID_CURR` values. The IDs do not overlap. I keep the samples separate and use `application_train` for comparisons with `TARGET`.
+
+## 5. Relative-time direction
+
+**Question:** Do relative-time variables follow the direction described in the data dictionary?
+
+```{r}
+# Check whether the relative-day variables have positive values.
+day_cols <- grep("^DAYS_", names(train), value = TRUE)
+
+time_check <- data.frame(
+  variable = day_cols,
+  positive_values = sapply(train[day_cols], function(x) sum(x > 0, na.rm = TRUE)),
+  min = sapply(train[day_cols], min, na.rm = TRUE),
+  max = sapply(train[day_cols], max, na.rm = TRUE)
+)
+
+knitr::kable(time_check, caption = "Direction check for DAYS_* variables", )
+```
+
+The relative-day fields are non-positive, as expected, except for `DAYS_EMPLOYED = 365243`. I can convert valid negative day counts to positive years. The employment sentinel needs to be set to missing first; it does not mean roughly 1,000 years of employment.
+
+## 6. Train/test consistency
+
+**Question:** Are the train and test application tables structurally and distributionally consistent enough for a common modeling workflow?
+
+```{r}
+# Compare columns in train and test.
+train_only_cols <- setdiff(names(train), names(test))
+test_only_cols <- setdiff(names(test), names(train))
+
+cat("Train-only columns:", paste(train_only_cols, collapse = ", "), "\n")
+cat("Test-only columns:", paste(test_only_cols, collapse = ", "), "\n")
+```
+
+```{r}
+# Compare categories that appear in only one of the two samples.
+common_character <- intersect(
+  names(train)[sapply(train, is.character)],
+  names(test)[sapply(test, is.character)]
+)
+
+level_differences <- bind_rows(lapply(common_character, function(v) {
+  train_levels <- unique(na.omit(train[[v]]))
+  test_levels <- unique(na.omit(test[[v]]))
+
+  data.frame(
+    variable = v,
+    train_only_levels = paste(setdiff(train_levels, test_levels), collapse = ", "),
+    test_only_levels = paste(setdiff(test_levels, train_levels), collapse = ", ")
+  )
+})) |>
+  filter(train_only_levels != "" | test_only_levels != "")
+
+knitr::kable(level_differences, caption = "Categorical levels not shared by train and test")
+```
+
+```{r}
+# Compare medians and missingness for eight numeric variables.
+consistency_cols <- c(
+  "AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY",
+  "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+  "DAYS_BIRTH", "AMT_REQ_CREDIT_BUREAU_YEAR"
+)
+
+numeric_consistency <- bind_rows(lapply(consistency_cols, function(v) {
+  data.frame(
+    variable = v,
+    train_median = median(train[[v]], na.rm = TRUE),
+    test_median = median(test[[v]], na.rm = TRUE),
+    train_missing_pct = mean(is.na(train[[v]])) * 100,
+    test_missing_pct = mean(is.na(test[[v]])) * 100
+  )
+}))
+
+knitr::kable(
+  numeric_consistency,
+  digits = 3,
+  caption = "Train/test comparison for selected numeric variables"
+)
+```
+
+The tables have the same columns except for `TARGET`, which appears only in train as expected. A few categories appear only in train, and some variables differ in missingness or median values. I would use a common modeling workflow and handle absent or unseen categories during preprocessing. The matching columns do not mean the distributions are identical.
+
+# Results
+
+I use a working copy for derived variables in the five business questions below. The original application tables stay unchanged.
+
+```{r}
+# Convert relative days to years, excluding the employment sentinel.
+eda <- train |>
+  mutate(
+    age_years = -DAYS_BIRTH / 365.25,
+    DAYS_EMPLOYED_CLEAN = na_if(DAYS_EMPLOYED, 365243),
+    tenure_years = -DAYS_EMPLOYED_CLEAN / 365.25
+  )
+```
+
+## 7. Proposed loan burden
+
+**Question:** Is payment difficulty associated with application-level proxies for the burden of the proposed loan relative to reported income?
+
+```{r}
+# Compare proposed-loan amounts with reported income.
+burden <- eda |>
+  mutate(
+    annuity_income = AMT_ANNUITY / AMT_INCOME_TOTAL,
+    credit_income = AMT_CREDIT / AMT_INCOME_TOTAL,
+    goods_income = AMT_GOODS_PRICE / AMT_INCOME_TOTAL
+  ) |>
+  select(TARGET, annuity_income, credit_income, goods_income)
+
+# Create five groups for each ratio.
+burden_summary <- burden |>
+  pivot_longer(-TARGET, names_to = "measure", values_to = "ratio") |>
+  filter(is.finite(ratio)) |>
+  group_by(measure) |>
+  mutate(band = ntile(ratio, 5)) |>
+  group_by(measure, band) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    min_value = min(ratio),
+    max_value = max(ratio),
+    .groups = "drop"
+  ) |>
+  mutate(
+    measure = recode(
+      measure,
+      annuity_income = "Annuity / income",
+      credit_income = "Credit / income",
+      goods_income = "Goods price / income"
+    )
+  ) |>
+  select(measure, band, n, payment_difficulty_rate, min_value, max_value) |>
+  arrange(match(measure, c("Annuity / income", "Credit / income", "Goods price / income")), band)
+
+knitr::kable(
+  burden_summary,
+  digits = 3,
+  caption = "Payment-difficulty rate by proposed-loan burden quintile"
+)
+```
+
+```{r}
+ggplot(burden_summary,
+       aes(x = factor(band), y = payment_difficulty_rate,
+           group = measure, linetype = measure)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Payment-difficulty rate by proposed-loan burden",
+    x = "Quintile (1 = lowest ratio)",
+    y = "Payment-difficulty rate (%)",
+    linetype = NULL
+  ) +
+  theme_minimal()
+```
+
+The three ratios do not show a steady increase in payment difficulty. The annuity-to-income rate rises through the fourth quintile. The highest credit-to-income and goods-price-to-income groups have lower rates than some middle groups. This may reflect how loans were approved or sized, so I cannot read it as a direct affordability effect. I would keep these ratios as candidate predictors. They are not approval rules or substitutes for total debt-to-income or residual cash flow, which I cannot calculate from these tables.
+
+## 8. External risk scores
+
+**Question:** How well do the external risk scores distinguish applicants who experience payment difficulty from those who do not?
+
+```{r}
+ext_vars <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+
+ext_long <- eda |>
+  select(TARGET, all_of(ext_vars)) |>
+  pivot_longer(-TARGET, names_to = "variable", values_to = "score")
+
+# Calculate rank-based AUC for each score.
+ext_auc <- ext_long |>
+  filter(!is.na(TARGET), !is.na(score)) |>
+  group_by(variable) |>
+  mutate(score_rank = rank(score, ties.method = "average")) |>
+  summarise(
+    n1 = sum(TARGET == 1),
+    n0 = sum(TARGET == 0),
+    rank_sum = sum(score_rank[TARGET == 1]),
+    .groups = "drop"
+  ) |>
+  mutate(
+    raw_auc = (rank_sum - n1 * (n1 + 1) / 2) / (as.double(n1) * n0),
+    direction_adjusted_AUC = pmax(raw_auc, 1 - raw_auc)
+  ) |>
+  select(variable, direction_adjusted_AUC)
+
+ext_summary <- ext_long |>
+  group_by(variable) |>
+  summarise(
+    nonmissing_n = sum(!is.na(score)),
+    missing_pct = mean(is.na(score)) * 100,
+    median_TARGET_0 = median(score[TARGET == 0], na.rm = TRUE),
+    median_TARGET_1 = median(score[TARGET == 1], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(ext_auc, by = "variable")
+
+knitr::kable(ext_summary, digits = 3, caption = "External-score summary")
+```
+
+```{r}
+# Create deciles separately for each external score.
+ext_deciles <- ext_long |>
+  filter(!is.na(score)) |>
+  group_by(variable) |>
+  mutate(decile = ntile(score, 10)) |>
+  group_by(variable, decile) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  )
+
+knitr::kable(ext_deciles, digits = 2, caption = "Payment-difficulty rate by external-score decile")
+
+ggplot(ext_deciles,
+       aes(x = factor(decile), y = payment_difficulty_rate,
+           group = variable, linetype = variable)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Payment-difficulty rate by external-score decile",
+    x = "Decile (1 = lowest score)",
+    y = "Payment-difficulty rate (%)",
+    linetype = NULL
+  ) +
+  theme_minimal()
+```
+
+Lower values of all three external scores are associated with higher payment-difficulty rates. The decile summaries show clear differences in payment-difficulty rates for all three scores. The dictionary does not identify the providers or explain how the scores are built, so I would use them as external risk signals without treating them as FICO-equivalent measures. All three remain priority candidate predictors, with their missingness preserved.
+
+## 9. Recent credit seeking
+
+**Question:** Is greater recent credit-seeking activity associated with higher payment difficulty?
+
+```{r}
+# Compare bureau inquiries by lookback window.
+inquiry_vars <- c(
+  "AMT_REQ_CREDIT_BUREAU_HOUR", "AMT_REQ_CREDIT_BUREAU_DAY",
+  "AMT_REQ_CREDIT_BUREAU_WEEK", "AMT_REQ_CREDIT_BUREAU_MON",
+  "AMT_REQ_CREDIT_BUREAU_QRT", "AMT_REQ_CREDIT_BUREAU_YEAR"
+)
+
+inquiry_summary <- eda |>
+  select(TARGET, all_of(inquiry_vars)) |>
+  pivot_longer(-TARGET, names_to = "window", values_to = "value") |>
+  mutate(
+    window = sub("AMT_REQ_CREDIT_BUREAU_", "", window),
+    window = factor(window, levels = c("HOUR", "DAY", "WEEK", "MON", "QRT", "YEAR")),
+    band = case_when(
+      is.na(value) ~ "Missing",
+      value == 0 ~ "0",
+      value == 1 ~ "1",
+      value == 2 ~ "2",
+      value >= 3 ~ "3+"
+    ),
+    band = factor(band, levels = c("0", "1", "2", "3+", "Missing"))
+  ) |>
+  group_by(window, band) |>
+  summarise(
+    n = n(),
+    applicant_pct = n() / nrow(eda) * 100,
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  ) |>
+  mutate(window = as.character(window))
+
+knitr::kable(inquiry_summary, digits = 2, caption = "Payment-difficulty rate by bureau-inquiry band")
+```
+
+```{r}
+# Plot monthly, quarterly, and annual inquiries.
+ggplot(
+  inquiry_summary |>
+    filter(window %in% c("MON", "QRT", "YEAR"), band != "Missing"),
+  aes(x = band, y = payment_difficulty_rate,
+      group = window, linetype = window)
+) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Payment-difficulty rate by bureau-inquiry count",
+    x = "Inquiry-count band",
+    y = "Payment-difficulty rate (%)",
+    linetype = "Lookback"
+  ) +
+  theme_minimal()
+```
+
+The annual window shows the clearest increase in payment difficulty as inquiry counts rise. The monthly and quarterly patterns are less consistent. Repeated credit seeking may reflect higher credit demand or financial stress. I would keep the windows separate because their patterns differ. I would also preserve their shared missingness, which is associated with a higher payment-difficulty rate.
+
+## 10. Income and employment context
+
+**Question:** Which available indicators of income level/source and current employment context or tenure are associated with payment difficulty?
+
+```{r}
+# Compare TARGET across five income groups.
+income_summary <- eda |>
+  filter(!is.na(AMT_INCOME_TOTAL)) |>
+  mutate(income_band = ntile(AMT_INCOME_TOTAL, 5)) |>
+  group_by(income_band) |>
+  summarise(
+    n = n(),
+    min_income = min(AMT_INCOME_TOTAL),
+    max_income = max(AMT_INCOME_TOTAL),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  )
+
+knitr::kable(income_summary, digits = 2, caption = "Payment-difficulty rate by income quintile")
+```
+
+```{r}
+# Keep missing income sources separate; combine small groups.
+income_type_summary <- eda |>
+  mutate(income_type_group = coalesce(NAME_INCOME_TYPE, "Missing")) |>
+  add_count(income_type_group, name = "income_n") |>
+  mutate(
+    income_type_group = case_when(
+      is.na(NAME_INCOME_TYPE) ~ "Missing",
+      income_n < 1000 ~ "Other (<1000)",
+      TRUE ~ NAME_INCOME_TYPE
+    )
+  ) |>
+  group_by(income_type_group) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  ) |>
+  arrange(desc(n))
+
+knitr::kable(income_type_summary, digits = 2, caption = "Payment-difficulty rate by income source")
+```
+
+```{r}
+# Show the employment sentinel as its own group.
+tenure_summary <- eda |>
+  mutate(
+    tenure_band = case_when(
+      DAYS_EMPLOYED == 365243 ~ "Sentinel / unknown",
+      tenure_years < 1 ~ "<1 year",
+      tenure_years < 3 ~ "1-<3 years",
+      tenure_years < 5 ~ "3-<5 years",
+      tenure_years < 10 ~ "5-<10 years",
+      tenure_years >= 10 ~ "10+ years"
+    ),
+    tenure_band = factor(
+      tenure_band,
+      levels = c("<1 year", "1-<3 years", "3-<5 years",
+                 "5-<10 years", "10+ years", "Sentinel / unknown")
+    )
+  ) |>
+  group_by(tenure_band) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  )
+
+knitr::kable(tenure_summary, digits = 2, caption = "Payment-difficulty rate by employment-tenure band")
+```
+
+```{r}
+# Combine small occupation and organization groups.
+employment_groups <- eda |>
+  mutate(
+    occupation_group = coalesce(na_if(OCCUPATION_TYPE, ""), "Missing"),
+    organization_group = coalesce(ORGANIZATION_TYPE, "Missing")
+  ) |>
+  add_count(occupation_group, name = "occupation_n") |>
+  add_count(organization_group, name = "organization_n") |>
+  mutate(
+    occupation_group = case_when(
+      occupation_group == "Missing" ~ "Missing",
+      occupation_n < 1000 ~ "Other (<1000)",
+      TRUE ~ occupation_group
+    ),
+    organization_group = case_when(
+      is.na(ORGANIZATION_TYPE) ~ "Missing",
+      organization_n < 3000 ~ "Other (<3000)",
+      TRUE ~ ORGANIZATION_TYPE
+    )
+  )
+
+occupation_summary <- employment_groups |>
+  group_by(occupation_group) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  ) |>
+  arrange(desc(payment_difficulty_rate))
+
+organization_summary <- employment_groups |>
+  group_by(organization_group) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  ) |>
+  arrange(desc(payment_difficulty_rate))
+
+knitr::kable(occupation_summary, digits = 2, caption = "Payment-difficulty rate by occupation")
+knitr::kable(organization_summary, digits = 2, caption = "Payment-difficulty rate by organization type")
+```
+
+```{r}
+ggplot(tenure_summary |> filter(tenure_band != "Sentinel / unknown"),
+       aes(x = tenure_band, y = payment_difficulty_rate, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Payment-difficulty rate by employment tenure",
+    x = "Current employment tenure",
+    y = "Payment-difficulty rate (%)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+The highest income quintile has a lower payment-difficulty rate. Payment-difficulty rates are similar in the first two tenure groups, then decrease as employment tenure increases. Income source, occupation, and organization type show differences between groups. These variables may reflect repayment capacity and employment stability, but they describe only the time of application. I would keep them as candidate predictors and clean the employment sentinel before using tenure numerically. I would evaluate rare-category grouping and encoding during model preprocessing. These results show associations, not causal effects.
+
+## 11. Strongest applicant associations
+
+**Question:** Which applicant characteristics are most strongly associated with payment difficulty?
+
+I compare each characteristic using the difference between its highest and lowest payment-difficulty rates. I keep groups with at least 1,000 applicants and compare characteristics with at least two remaining groups. This is a descriptive comparison, not a measure of feature importance.
+
+```{r}
+# Compare the same 18 applicant characteristics.
+# Keep the original quantile rules and row order.
+profile_long <- employment_groups |>
+  mutate(
+    EXT_SOURCE_1 = as.character(ntile(EXT_SOURCE_1, 10)),
+    EXT_SOURCE_2 = as.character(ntile(EXT_SOURCE_2, 10)),
+    EXT_SOURCE_3 = as.character(ntile(EXT_SOURCE_3, 10)),
+    `Occupation type` = occupation_group,
+    `Organization type` = organization_group,
+    Age = as.character(cut(
+      age_years,
+      breaks = c(-Inf, 25, 35, 45, 55, 65, Inf),
+      labels = c("≤25", ">25-35", ">35-45", ">45-55", ">55-65", ">65")
+    )),
+    `Employment tenure` = case_when(
+      DAYS_EMPLOYED == 365243 ~ NA_character_,
+      tenure_years < 1 ~ "<1 year",
+      tenure_years < 3 ~ "1-<3 years",
+      tenure_years < 5 ~ "3-<5 years",
+      tenure_years < 10 ~ "5-<10 years",
+      tenure_years >= 10 ~ "10+ years"
+    ),
+    `Education type` = as.character(NAME_EDUCATION_TYPE),
+    `Housing type` = as.character(NAME_HOUSING_TYPE),
+    `Income amount` = as.character(ntile(AMT_INCOME_TOTAL, 5)),
+    # Use the original income-source categories in this comparison.
+    `Income type` = as.character(NAME_INCOME_TYPE),
+    `Children count` = case_when(
+      CNT_CHILDREN == 0 ~ "0",
+      CNT_CHILDREN == 1 ~ "1",
+      CNT_CHILDREN == 2 ~ "2",
+      CNT_CHILDREN >= 3 ~ "3+"
+    ),
+    `Family members` = case_when(
+      CNT_FAM_MEMBERS <= 1 ~ "1",
+      CNT_FAM_MEMBERS == 2 ~ "2",
+      CNT_FAM_MEMBERS == 3 ~ "3",
+      CNT_FAM_MEMBERS == 4 ~ "4",
+      CNT_FAM_MEMBERS >= 5 ~ "5+"
+    ),
+    `Owns car` = as.character(FLAG_OWN_CAR),
+    `Owns realty` = as.character(FLAG_OWN_REALTY),
+    `Annual bureau inquiries` = case_when(
+      AMT_REQ_CREDIT_BUREAU_YEAR == 0 ~ "0",
+      AMT_REQ_CREDIT_BUREAU_YEAR == 1 ~ "1",
+      AMT_REQ_CREDIT_BUREAU_YEAR == 2 ~ "2",
+      AMT_REQ_CREDIT_BUREAU_YEAR >= 3 ~ "3+"
+    ),
+    annuity_income = AMT_ANNUITY / AMT_INCOME_TOTAL,
+    credit_income = AMT_CREDIT / AMT_INCOME_TOTAL,
+    `Annuity / income` = as.character(ntile(
+      if_else(is.finite(annuity_income), annuity_income, NA_real_), 5
+    )),
+    `Credit / income` = as.character(ntile(
+      if_else(is.finite(credit_income), credit_income, NA_real_), 5
+    ))
+  ) |>
+  select(
+    TARGET, all_of(ext_vars), `Occupation type`, `Organization type`, Age,
+    `Employment tenure`, `Education type`, `Housing type`, `Income amount`,
+    `Income type`, `Children count`, `Family members`, `Owns car`, `Owns realty`,
+    `Annual bureau inquiries`, `Annuity / income`, `Credit / income`
+  ) |>
+  pivot_longer(-TARGET, names_to = "characteristic", values_to = "group")
+
+# Compare groups with at least 1,000 applicants.
+association_rates <- profile_long |>
+  filter(!is.na(group)) |>
+  group_by(characteristic, group) |>
+  summarise(
+    n = n(),
+    payment_difficulty_rate = mean(TARGET) * 100,
+    .groups = "drop"
+  ) |>
+  filter(n >= 1000)
+
+association_rank <- association_rates |>
+  group_by(characteristic) |>
+  filter(n() >= 2) |>
+  summarise(
+    lowest_group = group[which.min(payment_difficulty_rate)],
+    lowest_rate = min(payment_difficulty_rate),
+    highest_group = group[which.max(payment_difficulty_rate)],
+    highest_rate = max(payment_difficulty_rate),
+    spread_pp = max(payment_difficulty_rate) - min(payment_difficulty_rate),
+    .groups = "drop"
+  ) |>
+  arrange(desc(spread_pp))
+
+knitr::kable(
+  association_rank,
+  digits = 2,
+  caption = "Largest descriptive payment-difficulty-rate spreads"
+)
+```
+
+```{r}
+# Plot the ten largest rate differences.
+ggplot(head(association_rank, 10),
+       aes(x = reorder(characteristic, spread_pp), y = spread_pp)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Largest descriptive associations with payment difficulty",
+    x = NULL,
+    y = "Rate spread (percentage points)"
+  ) +
+  theme_minimal()
+```
+
+The external scores have the largest rate spreads. Occupation and age also show meaningful differences. The application table already contains information that separates higher- and lower-risk groups before adding supplementary credit history. I still need a fitted model to evaluate these variables together. A large spread for one variable does not establish its contribution alongside other predictors.
+
+# Conclusion and data-preparation decisions
+
+The application data show meaningful differences in payment-difficulty rates. Across score deciles, the descriptive spread is about 16.8 percentage points for `EXT_SOURCE_3`, followed by 15.4 for `EXT_SOURCE_2` and 15.0 for `EXT_SOURCE_1`. Occupation type and age have spreads of about 12.3 and 8.6 percentage points. These are differences between the lowest- and highest-risk groups.
+
+The proposed-loan burden ratios do not show a steady increase in payment difficulty. A larger requested-loan-to-income ratio does not directly imply higher observed risk.
+
+The main data-quality findings and their preparation decisions are:
+
+| Data issue | Decision for data preparation |
+|---|---|
+| `DAYS_EMPLOYED = 365243` | Recode to missing before calculating `tenure_years` |
+| `REGION_RATING_CLIENT_W_CITY = -1` in test | Treat as invalid/missing rather than as a valid region rating |
+| `CODE_GENDER = XNA` | Treat as invalid/missing rather than mapping it to a valid category |
+| Building `*_MODE` fields described as normalized but observed as categories | Keep them categorical |
+| Missingness associated with `TARGET` in external-score and bureau-inquiry fields | Avoid complete-case deletion and preserve missingness indicators |
+| Extreme but not necessarily impossible values | Retain them unless there is evidence that they are invalid |
+| Train-only categorical levels | Handle unseen or absent levels during model preprocessing |
+| Nonlinear annuity-to-income pattern | Retain the ratio and a consistent five-group representation |
+| Minority `TARGET = 1` outcome | Preserve class proportions during validation and avoid accuracy-only evaluation |
+
+The EDA supports the BPS assumption that application data can distinguish repayment risk, especially through external scores, employment, and applicant characteristics. It also guides preprocessing: I need to account for nonlinear patterns, informative missingness, category differences, and the employment sentinel.
+
+I have not tested business targets, holdout ROC-AUC improvement, reason codes, approval thresholds, or model error rates by group. These require a fitted model and later validation. The application tables also lack the detailed credit history and household cash-flow information needed to establish true thin-file status or full affordability.
