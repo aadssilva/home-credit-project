@@ -28,4 +28,6 @@ docs/HomeCredit_columns_description.csv
 notebooks/01_eda_old.qmd
 notebooks/02_modeling.rmarkdown
 notebooks/.gitignore
-/scripts/0[3-7]_*.R
+
+# Local-only R scripts
+/scripts/*.R
